@@ -179,13 +179,17 @@ h .input type 'text', disabled
 `?` マッチとストリーム演算はビルド時データに対して使える（静的サイトの列挙など）。
 
 ```
+items = pages
+  |> map page ->
+    h .li
+      h .a href page.path
+        {page.title}
+
 h .ul
-  pages
-    |> map page ->
-      h .li
-        h .a href page.path
-          {page.title}
+  {items}
 ```
+
+（2026-07-05 決定: 子ブロック内の裸の式行は書けない。式はトップレベルで束縛し `{式}` で埋め込む。）
 
 ---
 

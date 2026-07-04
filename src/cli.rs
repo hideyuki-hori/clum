@@ -2,7 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::diag::Diagnostic;
+use crate::lexer::Lexer;
 use crate::source::SourceMap;
+use crate::token::TokenKind;
 
 const USAGE: &str = "使い方: clum build <path>";
 
@@ -30,14 +32,28 @@ fn run_build(path_arg: Option<&String>) -> u8 {
     };
 
     let path = PathBuf::from(path_arg);
-    match fs::read_to_string(&path) {
-        Ok(_content) => 0,
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
         Err(err) => {
             let display = path.display();
             let message = format!("ファイル `{display}` を読み込めません: {err}");
             let diagnostic = Diagnostic::error(message);
             eprintln!("{}", diagnostic.render(&SourceMap::new()));
-            1
+            return 1;
+        }
+    };
+
+    let mut sources = SourceMap::new();
+    let file = sources.add_file(path, content);
+    let mut lexer = Lexer::new(sources.get(file).content(), file);
+    loop {
+        match lexer.next() {
+            Ok(token) if token.kind == TokenKind::Eof => return 0,
+            Ok(_) => continue,
+            Err(diagnostic) => {
+                eprintln!("{}", diagnostic.render(&sources));
+                return 1;
+            }
         }
     }
 }

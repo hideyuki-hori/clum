@@ -1,6 +1,7 @@
 use crate::source::{FileId, SourceMap};
 use crate::span::Span;
 
+#[derive(Debug)]
 enum Severity {
     Error,
     Warning,
@@ -15,6 +16,7 @@ impl Severity {
     }
 }
 
+#[derive(Debug)]
 pub struct Diagnostic {
     severity: Severity,
     message: String,
