@@ -125,6 +125,88 @@ impl<'a> Lexer<'a> {
         Ok((text, Span::new(start, end)))
     }
 
+    pub fn peek_structural(&mut self) -> Result<Option<TokenKind>, Diagnostic> {
+        if let Some((token, _)) = &self.lookahead {
+            if is_structural(&token.kind) {
+                return Ok(Some(token.kind.clone()));
+            }
+            return Ok(None);
+        }
+        if self.mode == Mode::NeedIndent {
+            self.process_indentation()?;
+        }
+        if let Some(token) = self.pending.front() {
+            if is_structural(&token.kind) {
+                return Ok(Some(token.kind.clone()));
+            }
+            return Ok(None);
+        }
+        if self.mode == Mode::Done {
+            return Ok(Some(TokenKind::Eof));
+        }
+        Ok(None)
+    }
+
+    pub fn take_text_line(&mut self) -> Result<(StrLiteral, Span), Diagnostic> {
+        if let Some((token, _)) = self.lookahead.take() {
+            if is_structural(&token.kind) {
+                self.pending.push_front(token);
+            } else {
+                self.pos = token.span.start;
+            }
+        }
+        if self.mode == Mode::NeedIndent {
+            self.process_indentation()?;
+        }
+        let start = self.pos;
+        let mut segments = Vec::new();
+        let mut text_start = self.pos;
+        while !self.at_eof() && self.current_char() != '\n' {
+            let ch = self.current_char();
+            if ch == '{' {
+                if self.peek_char_at(self.pos + 1) == Some('{') {
+                    self.pos += 2;
+                    continue;
+                }
+                if self.pos > text_start {
+                    segments.push(StrSegment::Text(Span::new(text_start, self.pos)));
+                }
+                let interp_start = self.pos;
+                self.pos += 1;
+                let tokens = self.lex_interpolation(interp_start, true)?;
+                segments.push(StrSegment::Interp(
+                    tokens,
+                    Span::new(interp_start, self.pos),
+                ));
+                text_start = self.pos;
+                continue;
+            }
+            if ch == '}' {
+                if self.peek_char_at(self.pos + 1) == Some('}') {
+                    self.pos += 2;
+                    continue;
+                }
+                return Err(
+                    Diagnostic::error("`}` をテキストに書くには `}}` と書きます")
+                        .at(self.file, Span::new(self.pos, self.pos + 1)),
+                );
+            }
+            self.pos += ch.len_utf8();
+        }
+        let end = self.pos;
+        if end > text_start {
+            segments.push(StrSegment::Text(Span::new(text_start, end)));
+        }
+        self.pos = if end < self.source.len() {
+            end + 1
+        } else {
+            end
+        };
+        self.mode = Mode::NeedIndent;
+        self.line_head = false;
+        Ok((StrLiteral { segments }, Span::new(start, end)))
+    }
+
     fn advance_raw(&mut self) -> Result<Token, Diagnostic> {
         loop {
             if let Some(token) = self.pending.pop_front() {
@@ -304,7 +386,11 @@ impl<'a> Lexer<'a> {
         ))
     }
 
-    fn lex_interpolation(&mut self, open_pos: usize) -> Result<Vec<Token>, Diagnostic> {
+    fn lex_interpolation(
+        &mut self,
+        open_pos: usize,
+        allow_string: bool,
+    ) -> Result<Vec<Token>, Diagnostic> {
         let mut tokens = Vec::new();
         loop {
             self.skip_inline_whitespace()?;
@@ -318,6 +404,11 @@ impl<'a> Lexer<'a> {
                 return Ok(tokens);
             }
             if ch == '\'' {
+                if allow_string {
+                    let token = self.lex_string()?;
+                    tokens.push(token);
+                    continue;
+                }
                 return Err(Diagnostic::error("補間式の中に文字列リテラルは書けません")
                     .at(self.file, Span::new(self.pos, self.pos + 1)));
             }
@@ -358,7 +449,7 @@ impl<'a> Lexer<'a> {
                 }
                 let interp_start = self.pos;
                 self.pos += 1;
-                let tokens = self.lex_interpolation(interp_start)?;
+                let tokens = self.lex_interpolation(interp_start, false)?;
                 segments.push(StrSegment::Interp(
                     tokens,
                     Span::new(interp_start, self.pos),
@@ -1332,6 +1423,128 @@ mod tests {
         assert_eq!(lexer.next().unwrap().kind, TokenKind::Eof);
         assert_eq!(lexer.next().unwrap().kind, TokenKind::Eof);
         assert_eq!(lexer.next().unwrap().kind, TokenKind::Eof);
+    }
+
+    #[test]
+    fn peek_structural_reports_indent_then_dedent() {
+        let mut sources = SourceMap::new();
+        let file = sources.add_file(PathBuf::from("t.clum"), String::new());
+        let src = "h .div\n  こんにちは\n";
+        let mut lexer = Lexer::new(src, file);
+        assert_eq!(
+            lexer.next().unwrap().kind,
+            TokenKind::Ident("h".to_string())
+        );
+        assert_eq!(
+            lexer.next().unwrap().kind,
+            TokenKind::DotIdent("div".to_string())
+        );
+        assert_eq!(lexer.next().unwrap().kind, TokenKind::Newline);
+
+        assert_eq!(lexer.peek_structural().unwrap(), Some(TokenKind::Indent));
+        assert_eq!(lexer.next().unwrap().kind, TokenKind::Indent);
+
+        assert_eq!(lexer.peek_structural().unwrap(), None);
+        assert_eq!(lexer.classify_line_head().unwrap(), LineHead::Text);
+        let (text, _) = lexer.take_text_line().unwrap();
+        assert_eq!(text.segments.len(), 1);
+
+        assert_eq!(lexer.peek_structural().unwrap(), Some(TokenKind::Dedent));
+        assert_eq!(lexer.next().unwrap().kind, TokenKind::Dedent);
+        assert_eq!(lexer.peek_structural().unwrap(), Some(TokenKind::Eof));
+    }
+
+    #[test]
+    fn take_text_line_splits_text_and_interp() {
+        let mut sources = SourceMap::new();
+        let file = sources.add_file(PathBuf::from("t.clum"), String::new());
+        let src = "h .li\n  {page.title} さん\n";
+        let mut lexer = Lexer::new(src, file);
+        assert_eq!(
+            lexer.next().unwrap().kind,
+            TokenKind::Ident("h".to_string())
+        );
+        assert_eq!(
+            lexer.next().unwrap().kind,
+            TokenKind::DotIdent("li".to_string())
+        );
+        assert_eq!(lexer.next().unwrap().kind, TokenKind::Newline);
+        assert_eq!(lexer.next().unwrap().kind, TokenKind::Indent);
+
+        assert_eq!(lexer.classify_line_head().unwrap(), LineHead::LBrace);
+        let (line, _) = lexer.take_text_line().unwrap();
+        assert_eq!(line.segments.len(), 2);
+        match &line.segments[0] {
+            StrSegment::Interp(tokens, _) => {
+                assert_eq!(tokens[0].kind, TokenKind::Ident("page".to_string()));
+                assert_eq!(tokens[1].kind, TokenKind::Dot);
+                assert_eq!(tokens[2].kind, TokenKind::Ident("title".to_string()));
+            }
+            other => panic!("Interp を期待しましたが {other:?} でした"),
+        }
+        match &line.segments[1] {
+            StrSegment::Text(span) => assert_eq!(&src[span.start..span.end], " さん"),
+            other => panic!("Text を期待しましたが {other:?} でした"),
+        }
+    }
+
+    #[test]
+    fn take_text_line_allows_string_in_interp() {
+        let mut sources = SourceMap::new();
+        let file = sources.add_file(PathBuf::from("t.clum"), String::new());
+        let src = "h .p\n  {'h で始まる文'}\n";
+        let mut lexer = Lexer::new(src, file);
+        assert_eq!(
+            lexer.next().unwrap().kind,
+            TokenKind::Ident("h".to_string())
+        );
+        assert_eq!(
+            lexer.next().unwrap().kind,
+            TokenKind::DotIdent("p".to_string())
+        );
+        assert_eq!(lexer.next().unwrap().kind, TokenKind::Newline);
+        assert_eq!(lexer.next().unwrap().kind, TokenKind::Indent);
+
+        assert_eq!(lexer.classify_line_head().unwrap(), LineHead::LBrace);
+        let (line, _) = lexer.take_text_line().unwrap();
+        assert_eq!(line.segments.len(), 1);
+        match &line.segments[0] {
+            StrSegment::Interp(tokens, _) => {
+                assert_eq!(tokens.len(), 1);
+                assert!(matches!(tokens[0].kind, TokenKind::Str(_)));
+            }
+            other => panic!("Interp を期待しましたが {other:?} でした"),
+        }
+    }
+
+    #[test]
+    fn take_text_line_keeps_double_brace_raw() {
+        let mut sources = SourceMap::new();
+        let file = sources.add_file(PathBuf::from("t.clum"), String::new());
+        let src = "h .p\n  a {{b}} c\n";
+        let mut lexer = Lexer::new(src, file);
+        for _ in 0..4 {
+            let _ = lexer.next().unwrap();
+        }
+        let (line, _) = lexer.take_text_line().unwrap();
+        assert_eq!(line.segments.len(), 1);
+        match &line.segments[0] {
+            StrSegment::Text(span) => assert_eq!(&src[span.start..span.end], "a {{b}} c"),
+            other => panic!("Text を期待しましたが {other:?} でした"),
+        }
+    }
+
+    #[test]
+    fn take_text_line_lone_closing_brace_is_error() {
+        let src = "h .p\n  a}b\n";
+        let mut sources = SourceMap::new();
+        let file = sources.add_file(PathBuf::from("t.clum"), src.to_string());
+        let mut lexer = Lexer::new(src, file);
+        for _ in 0..4 {
+            let _ = lexer.next().unwrap();
+        }
+        let err = lexer.take_text_line().expect_err("エラーを期待しました");
+        assert!(err.render(&sources).contains("`}}`"));
     }
 
     #[test]

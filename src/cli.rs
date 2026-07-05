@@ -2,9 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::diag::Diagnostic;
-use crate::lexer::Lexer;
+use crate::parser;
 use crate::source::SourceMap;
-use crate::token::TokenKind;
 
 const USAGE: &str = "使い方: clum build <path>";
 
@@ -45,15 +44,11 @@ fn run_build(path_arg: Option<&String>) -> u8 {
 
     let mut sources = SourceMap::new();
     let file = sources.add_file(path, content);
-    let mut lexer = Lexer::new(sources.get(file).content(), file);
-    loop {
-        match lexer.next() {
-            Ok(token) if token.kind == TokenKind::Eof => return 0,
-            Ok(_) => continue,
-            Err(diagnostic) => {
-                eprintln!("{}", diagnostic.render(&sources));
-                return 1;
-            }
+    match parser::parse(sources.get(file).content(), file) {
+        Ok(_) => 0,
+        Err(diagnostic) => {
+            eprintln!("{}", diagnostic.render(&sources));
+            1
         }
     }
 }
