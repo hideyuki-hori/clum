@@ -1,0 +1,9 @@
+:pub
+index: Html = h .input type 'text', disabled
+
+Recipe
+  documents:
+    - path: './dist/index.html'
+      element: index
+  |> build
+  |> !
