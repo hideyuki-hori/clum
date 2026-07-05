@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::diag::Diagnostic;
+use crate::eval;
 use crate::resolve;
 use crate::source::SourceMap;
 use crate::typeck;
@@ -52,13 +53,19 @@ fn run_build(path_arg: Option<&String>) -> u8 {
             return 1;
         }
     };
-    match typeck::check_program(&program) {
-        Ok(warnings) => {
-            for warning in &warnings {
-                eprintln!("{}", warning.render(&sources));
-            }
-            0
+    let warnings = match typeck::check_program(&program) {
+        Ok(warnings) => warnings,
+        Err(diagnostic) => {
+            eprintln!("{}", diagnostic.render(&sources));
+            return 1;
         }
+    };
+    for warning in &warnings {
+        eprintln!("{}", warning.render(&sources));
+    }
+
+    match eval::eval_program(&sources, &program) {
+        Ok(()) => 0,
         Err(diagnostic) => {
             eprintln!("{}", diagnostic.render(&sources));
             1

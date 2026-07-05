@@ -279,7 +279,18 @@ impl<'a> Checker<'a> {
 
     fn infer_expr(&mut self, expr: &Expr) -> Result<Ty, Diagnostic> {
         match expr {
-            Expr::Int { .. } => Ok(Ty::I32),
+            Expr::Int { value, span } => {
+                if i64::from(i32::MIN) <= *value && *value <= i64::from(i32::MAX) {
+                    Ok(Ty::I32)
+                } else {
+                    Err(self.error(
+                        format!(
+                            "整数リテラル `{value}` は `i32` の範囲（-2147483648〜2147483647）に収まりません"
+                        ),
+                        *span,
+                    ))
+                }
+            }
             Expr::Float { .. } => Ok(Ty::F64),
             Expr::Str { parts, .. } => {
                 self.check_interp_parts(parts)?;
@@ -1199,6 +1210,16 @@ mod tests {
             "      {page.title} さん\n",
         );
         assert!(expect_ok(src).is_empty());
+    }
+
+    #[test]
+    fn int_literal_out_of_i32_range_is_error() {
+        let message = error_of("x = 2147483648\n");
+        assert!(message.contains("`i32` の範囲"));
+        let message = error_of("y = -2147483649\n");
+        assert!(message.contains("`i32` の範囲"));
+        expect_ok("a = 2147483647\n");
+        expect_ok("b = -2147483648\n");
     }
 
     #[test]

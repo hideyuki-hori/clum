@@ -1,6 +1,8 @@
 pub mod ast;
 pub mod cli;
 pub mod diag;
+pub mod emit;
+pub mod eval;
 pub mod lexer;
 pub mod parser;
 pub mod prelude;
@@ -10,3 +12,4 @@ pub mod span;
 pub mod token;
 pub mod ty;
 pub mod typeck;
+pub mod value;
