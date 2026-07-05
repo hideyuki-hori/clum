@@ -1,0 +1,24 @@
+# Card title: String, body: Vec<Html> -> Html
+
+card: Card title, body ->
+  h .div
+    h .h2
+      {title}
+    h .div
+      {body}
+
+:pub
+index: Html = h .html
+  h .body
+    Card 'News'
+      h .p
+        {'First item'}
+      h .p
+        {'Second item'}
+
+Recipe
+  documents:
+    - path: './dist/index.html'
+      element: index
+  |> build
+  |> !

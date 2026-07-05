@@ -1,0 +1,10 @@
+:pub
+about: Html = h .html
+  h .head
+    h .title
+      {'About'}
+  h .body
+    h .h1
+      {'About Us'}
+    h .p
+      {'This is the about page'}

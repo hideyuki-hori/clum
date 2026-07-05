@@ -1,0 +1,26 @@
+# Page path: String, title: String
+
+pages: Vec<Page> =
+  - path: '/home'
+    title: 'Home'
+  - path: '/about'
+    title: 'About'
+
+items = pages
+  |> map page ->
+    h .li
+      h .a href page.path
+        {page.title}
+
+:pub
+index: Html = h .html
+  h .body
+    h .ul
+      {items}
+
+Recipe
+  documents:
+    - path: './dist/index.html'
+      element: index
+  |> build
+  |> !

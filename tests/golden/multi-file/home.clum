@@ -1,0 +1,10 @@
+:pub
+home: Html = h .html
+  h .head
+    h .title
+      {'Home'}
+  h .body
+    h .h1
+      {'Welcome'}
+    h .p
+      {'This is the home page'}

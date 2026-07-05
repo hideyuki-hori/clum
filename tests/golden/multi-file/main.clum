@@ -1,0 +1,14 @@
+@ ./about
+  about
+
+@ ./home
+  home
+
+Recipe
+  documents:
+    - path: './dist/about.html'
+      element: about
+    - path: './dist/home.html'
+      element: home
+  |> build
+  |> !

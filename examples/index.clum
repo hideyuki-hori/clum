@@ -1,0 +1,23 @@
+# Page path: String, title: String
+
+pages: Vec<Page> =
+  - path: '/index'
+    title: 'Home'
+  - path: '/about'
+    title: 'About'
+
+items = pages
+  |> map page ->
+    h .li
+      h .a href page.path
+        {page.title}
+
+:pub
+index: Html = h .html
+  h .head
+    h .meta charset 'utf-8'
+    h .title
+      clum
+  h .body
+    h .ul
+      {items}
