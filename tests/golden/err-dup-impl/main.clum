@@ -1,0 +1,3 @@
+# Greet name: String -> String
+hi: Greet name -> name
+yo: Greet name -> name

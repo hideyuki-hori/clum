@@ -1,0 +1,6 @@
+# Make prefix: String, items: Vec<Html> -> Vec<Html>
+make: Make prefix, items ->
+  items
+    |> map item ->
+      h .li
+        {prefix}

@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::diag::Diagnostic;
-use crate::parser;
+use crate::resolve;
 use crate::source::SourceMap;
 
 const USAGE: &str = "使い方: clum build <path>";
@@ -44,7 +44,7 @@ fn run_build(path_arg: Option<&String>) -> u8 {
 
     let mut sources = SourceMap::new();
     let file = sources.add_file(path, content);
-    match parser::parse(sources.get(file).content(), file) {
+    match resolve::resolve_program(&mut sources, file) {
         Ok(_) => 0,
         Err(diagnostic) => {
             eprintln!("{}", diagnostic.render(&sources));

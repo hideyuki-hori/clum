@@ -1,0 +1,6 @@
+title = 'home'
+# Make x: String -> Html
+make: Make x ->
+  title = x
+  h .div
+    {title}

@@ -1,0 +1,5 @@
+error: `wrong` は `./page` の export ではありません
+ --> main.clum:2:3
+  |
+2 |   wrong
+  |   ^^^^^ `./page` の export は `index` です

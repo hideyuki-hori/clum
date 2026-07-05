@@ -1,0 +1,4 @@
+:pub
+a: Html = h .div
+:pub
+b: Html = h .span

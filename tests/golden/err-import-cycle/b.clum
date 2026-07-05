@@ -1,0 +1,6 @@
+@ ./a
+  a
+
+:pub
+b: Html = h .div
+  {a}
