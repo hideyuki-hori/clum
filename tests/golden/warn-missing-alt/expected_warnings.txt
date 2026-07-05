@@ -1,0 +1,5 @@
+warning: img 要素に alt 属性がありません
+ --> main.clum:3:5
+  |
+3 |   h .img src '/logo.png'
+  |     ^^^^ アクセシビリティのため alt を付けてください

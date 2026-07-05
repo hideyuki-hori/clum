@@ -1,0 +1,5 @@
+:pub
+index: Html = h .html
+  h .body
+    h .dvi
+      本文

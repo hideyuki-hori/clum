@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use crate::diag::Diagnostic;
 use crate::resolve;
 use crate::source::SourceMap;
+use crate::typeck;
 
 const USAGE: &str = "使い方: clum build <path>";
 
@@ -44,8 +45,20 @@ fn run_build(path_arg: Option<&String>) -> u8 {
 
     let mut sources = SourceMap::new();
     let file = sources.add_file(path, content);
-    match resolve::resolve_program(&mut sources, file) {
-        Ok(_) => 0,
+    let program = match resolve::resolve_program(&mut sources, file) {
+        Ok(program) => program,
+        Err(diagnostic) => {
+            eprintln!("{}", diagnostic.render(&sources));
+            return 1;
+        }
+    };
+    match typeck::check_program(&program) {
+        Ok(warnings) => {
+            for warning in &warnings {
+                eprintln!("{}", warning.render(&sources));
+            }
+            0
+        }
         Err(diagnostic) => {
             eprintln!("{}", diagnostic.render(&sources));
             1

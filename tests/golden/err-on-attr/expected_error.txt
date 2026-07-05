@@ -1,0 +1,5 @@
+error: `on-*` 属性 `on-click` は html ターゲットでは使えません
+ --> main.clum:2:25
+  |
+2 | index: Html = h .button on-click 'handle'
+  |                         ^^^^^^^^ イベントは js ターゲットの責務です

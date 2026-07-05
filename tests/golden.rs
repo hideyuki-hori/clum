@@ -19,7 +19,9 @@ fn golden_root() -> PathBuf {
 }
 
 fn is_excluded(name: &OsStr) -> bool {
-    name == OsStr::new("expected") || name == OsStr::new("expected_error.txt")
+    name == OsStr::new("expected")
+        || name == OsStr::new("expected_error.txt")
+        || name == OsStr::new("expected_warnings.txt")
 }
 
 fn copy_case_inputs(src: &Path, dst: &Path) {
@@ -116,6 +118,24 @@ fn run_case(case_dir: &Path, update: bool) {
         Some(0),
         "case {case_name}: 終了コードが一致しません"
     );
+
+    let expected_warnings_path = case_dir.join("expected_warnings.txt");
+    if expected_warnings_path.is_file() {
+        let actual_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if update {
+            fs::write(&expected_warnings_path, &actual_stderr).unwrap_or_else(|e| {
+                panic!("case {case_name}: expected_warnings.txt の書き込みに失敗しました: {e}")
+            });
+        } else {
+            let expected_stderr = fs::read_to_string(&expected_warnings_path).unwrap_or_else(|e| {
+                panic!("case {case_name}: expected_warnings.txt の読み取りに失敗しました: {e}")
+            });
+            assert_eq!(
+                actual_stderr, expected_stderr,
+                "case {case_name}: 警告の stderr が一致しません"
+            );
+        }
+    }
 
     let expected_dir = case_dir.join("expected");
     if expected_dir.is_dir() {

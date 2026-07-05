@@ -1,0 +1,5 @@
+error: `.div` 要素に属性 `foo` はありません
+ --> main.clum:2:22
+  |
+2 | index: Html = h .div foo 'bar'
+  |                      ^^^ data-* / aria-* は任意に使えます
