@@ -868,6 +868,9 @@ impl<'a> Checker<'a> {
                 component.span,
             ));
         }
+        if last.is_html() {
+            self.check_single_html_child(component)?;
+        }
         if component.args.len() != explicit.len() {
             return Err(self.error(
                 format!(
@@ -884,6 +887,34 @@ impl<'a> Checker<'a> {
         }
         for child in &component.children {
             self.check_child(child)?;
+        }
+        Ok(())
+    }
+
+    fn check_single_html_child(&mut self, component: &Component) -> Result<(), Diagnostic> {
+        if component.children.len() > 1 {
+            return Err(self.error(
+                format!(
+                    "コンポーネント `{}` の末尾引数は `Html`（1個）ですが、子が{}個あります（複数の子を受け取るには `Vec<Html>` を宣言してください）",
+                    component.name.text,
+                    component.children.len()
+                ),
+                component.name.span,
+            ));
+        }
+        if let [Child::Text { parts, .. }] = component.children.as_slice()
+            && let [StrPart::Interp { expr, .. }] = parts.as_slice()
+        {
+            let ty = self.infer_expr(expr)?;
+            if ty.is_vec_of_html() {
+                return Err(self.error(
+                    format!(
+                        "コンポーネント `{}` の末尾引数は `Html`（1個）ですが、`Vec<Html>` 型の値が埋め込まれています（複数の子を受け取るには `Vec<Html>` を宣言してください）",
+                        component.name.text
+                    ),
+                    expr.span(),
+                ));
+            }
         }
         Ok(())
     }
@@ -1080,6 +1111,79 @@ mod tests {
             "      本文\n",
         );
         assert!(expect_ok(src).is_empty());
+    }
+
+    #[test]
+    fn component_with_vec_html_children_ok() {
+        let src = concat!(
+            "# Card title: String, body: Vec<Html> -> Html\n",
+            "card: Card title, body -> h .div\n",
+            "  {body}\n",
+            ":pub\n",
+            "page: Html = h .body\n",
+            "  Card 'お知らせ'\n",
+            "    h .p\n",
+            "      本文\n",
+            "    h .p\n",
+            "      追伸\n",
+        );
+        assert!(expect_ok(src).is_empty());
+    }
+
+    #[test]
+    fn component_single_html_child_embed_ok() {
+        let src = concat!(
+            "para: Html = h .p\n",
+            "  本文\n",
+            "# Card title: String, body: Html -> Html\n",
+            "card: Card title, body -> h .div\n",
+            "  {title}\n",
+            ":pub\n",
+            "page: Html = h .body\n",
+            "  Card 'お知らせ'\n",
+            "    {para}\n",
+        );
+        assert!(expect_ok(src).is_empty());
+    }
+
+    #[test]
+    fn component_multi_child_into_single_html_is_error() {
+        let src = concat!(
+            "# Card title: String, body: Html -> Html\n",
+            "card: Card title, body -> h .div\n",
+            "  {title}\n",
+            ":pub\n",
+            "page: Html = h .body\n",
+            "  Card 'お知らせ'\n",
+            "    h .p\n",
+            "      本文\n",
+            "    h .p\n",
+            "      追伸\n",
+        );
+        let message = error_of(src);
+        assert!(message.contains("末尾引数は `Html`（1個）ですが、子が2個あります"));
+        assert!(message.contains("`Vec<Html>` を宣言してください"));
+    }
+
+    #[test]
+    fn component_vec_html_embed_into_single_html_is_error() {
+        let src = concat!(
+            "para: Html = h .p\n",
+            "  本文\n",
+            "items: Vec<Html> =\n",
+            "  - para\n",
+            "  - para\n",
+            "# Card title: String, body: Html -> Html\n",
+            "card: Card title, body -> h .div\n",
+            "  {title}\n",
+            ":pub\n",
+            "page: Html = h .body\n",
+            "  Card 'お知らせ'\n",
+            "    {items}\n",
+        );
+        let message = error_of(src);
+        assert!(message.contains("`Vec<Html>` 型の値が埋め込まれています"));
+        assert!(message.contains("`Vec<Html>` を宣言してください"));
     }
 
     #[test]
