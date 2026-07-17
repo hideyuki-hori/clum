@@ -1,0 +1,125 @@
+{
+  "name": "clum",
+  "scopeName": "source.clum",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#string" },
+    { "include": "#decl-mark" },
+    { "include": "#import" },
+    { "include": "#export-mark" },
+    { "include": "#list-marker" },
+    { "include": "#brace-escape" },
+    { "include": "#embed" },
+    { "include": "#pipe" },
+    { "include": "#arrow" },
+    { "include": "#assign" },
+    { "include": "#bang" },
+    { "include": "#colon-word" },
+    { "include": "#h-form" },
+    { "include": "#tag-literal" },
+    { "include": "#field-name" },
+    { "include": "#type-name" },
+    { "include": "#number" }
+  ],
+  "repository": {
+    "comment": {
+      "match": "//.*$",
+      "name": "comment.line.double-slash.clum"
+    },
+    "string": {
+      "begin": "'",
+      "end": "'",
+      "name": "string.quoted.single.clum",
+      "patterns": [
+        { "include": "#brace-escape" },
+        {
+          "begin": "\\{",
+          "end": "\\}",
+          "name": "meta.interpolation.clum",
+          "beginCaptures": { "0": { "name": "punctuation.definition.interpolation.begin.clum" } },
+          "endCaptures": { "0": { "name": "punctuation.definition.interpolation.end.clum" } },
+          "patterns": [
+            { "include": "#type-name" },
+            { "include": "#number" }
+          ]
+        }
+      ]
+    },
+    "brace-escape": {
+      "match": "\\{\\{|\\}\\}",
+      "name": "constant.character.escape.clum"
+    },
+    "embed": {
+      "begin": "\\{",
+      "end": "\\}",
+      "name": "meta.embedded.line.clum",
+      "beginCaptures": { "0": { "name": "punctuation.definition.interpolation.begin.clum" } },
+      "endCaptures": { "0": { "name": "punctuation.definition.interpolation.end.clum" } },
+      "patterns": [
+        { "include": "#string" },
+        { "include": "#colon-word" },
+        { "include": "#type-name" },
+        { "include": "#number" }
+      ]
+    },
+    "decl-mark": {
+      "match": "^\\s*(#)(?=\\s)",
+      "captures": { "1": { "name": "keyword.other.declaration.clum" } }
+    },
+    "import": {
+      "match": "^\\s*(@)\\s*(\\S+)?",
+      "captures": {
+        "1": { "name": "keyword.control.import.clum" },
+        "2": { "name": "string.unquoted.path.clum" }
+      }
+    },
+    "export-mark": {
+      "match": "^\\s*(\\^)\\s*$",
+      "captures": { "1": { "name": "keyword.control.export.clum" } }
+    },
+    "list-marker": {
+      "match": "^\\s*(-)(?=\\s)",
+      "captures": { "1": { "name": "punctuation.definition.list.clum" } }
+    },
+    "pipe": {
+      "match": "\\|>",
+      "name": "keyword.operator.pipe.clum"
+    },
+    "arrow": {
+      "match": "->",
+      "name": "keyword.operator.arrow.clum"
+    },
+    "assign": {
+      "match": "(?<=\\s)=(?=\\s|$)",
+      "name": "keyword.operator.assignment.clum"
+    },
+    "bang": {
+      "match": "(?:^|(?<=\\s))!(?=\\s|$)",
+      "name": "keyword.operator.effect.clum"
+    },
+    "colon-word": {
+      "match": "(?:^|(?<=\\s)):[a-z][a-z0-9-]*\\b",
+      "name": "keyword.other.colon.clum"
+    },
+    "h-form": {
+      "match": "(?:^|(?<=\\s))h(?=\\s+\\.)",
+      "name": "keyword.control.element.clum"
+    },
+    "tag-literal": {
+      "match": "(?:^|(?<=\\s))\\.[a-z][a-z0-9-]*\\b",
+      "name": "constant.language.tag.clum"
+    },
+    "field-name": {
+      "match": "\\b[a-z][a-z0-9-]*(?=:(?:\\s|$))",
+      "name": "entity.name.tag.clum"
+    },
+    "type-name": {
+      "match": "\\b[A-Z][A-Za-z0-9]*\\b",
+      "name": "entity.name.type.clum"
+    },
+    "number": {
+      "match": "(?:(?<=[\\s,(\\[{])|^)-?\\d+(?:\\.\\d+)?\\b",
+      "name": "constant.numeric.clum"
+    }
+  }
+}
