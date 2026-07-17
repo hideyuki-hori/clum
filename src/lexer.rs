@@ -364,7 +364,17 @@ impl<'a> Lexer<'a> {
     }
 
     fn lex_path(&mut self) -> Result<Token, Diagnostic> {
-        self.skip_inline_whitespace()?;
+        if let Some(' ' | '\t') = self.current_char_opt() {
+            let ws_start = self.pos;
+            self.skip_inline_whitespace()?;
+            if self.at_eof() || self.current_char() == '\n' {
+                return Err(Diagnostic::error("`@` の後にパスが必要です")
+                    .at(self.file, Span::new(ws_start, ws_start)));
+            }
+            return Err(Diagnostic::error("`@` とパスのあいだに空白は書けません")
+                .at(self.file, Span::new(ws_start, self.pos))
+                .with_label("パスは `@` に密着させます（例: `@./index`）"));
+        }
         if self.at_eof() || self.current_char() == '\n' {
             let pos = self.pos;
             return Err(
@@ -792,9 +802,9 @@ mod tests {
     }
 
     #[test]
-    fn at_with_space_reads_relative_path() {
+    fn at_reads_relative_path() {
         assert_eq!(
-            tokens_of("@ ./components/card"),
+            tokens_of("@./components/card"),
             vec![
                 TokenKind::At,
                 TokenKind::Path("./components/card".to_string()),
@@ -824,6 +834,19 @@ mod tests {
     }
 
     #[test]
+    fn at_with_space_before_path_is_error() {
+        let message = error_message("@ ./index\n");
+        assert!(message.contains("`@` とパスのあいだに空白は書けません"));
+        assert!(message.contains("@./index"));
+    }
+
+    #[test]
+    fn at_with_only_spaces_is_error() {
+        let message = error_message("@  \n");
+        assert!(message.contains("パスが必要です"));
+    }
+
+    #[test]
     fn at_at_eof_without_path_is_error() {
         let message = error_message("@");
         assert!(message.contains("パスが必要です"));
@@ -832,7 +855,7 @@ mod tests {
     #[test]
     fn path_followed_by_comment_is_stripped() {
         assert_eq!(
-            tokens_of("@ ./index // メモ\n"),
+            tokens_of("@./index // メモ\n"),
             vec![
                 TokenKind::At,
                 TokenKind::Path("./index".to_string()),

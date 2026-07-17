@@ -67,15 +67,18 @@
       "captures": { "1": { "name": "keyword.other.declaration.clum" } }
     },
     "import": {
-      "match": "^\\s*(@)\\s*(\\S+)?",
+      "match": "^\\s*(@)(\\S+)?",
       "captures": {
         "1": { "name": "keyword.control.import.clum" },
         "2": { "name": "string.unquoted.path.clum" }
       }
     },
     "export-mark": {
-      "match": "^\\s*(\\^)\\s*$",
-      "captures": { "1": { "name": "keyword.control.export.clum" } }
+      "match": "^(\\^)([a-z][a-z0-9-]*)?",
+      "captures": {
+        "1": { "name": "keyword.control.export.clum" },
+        "2": { "name": "variable.other.export.clum" }
+      }
     },
     "list-marker": {
       "match": "^\\s*(-)(?=\\s)",

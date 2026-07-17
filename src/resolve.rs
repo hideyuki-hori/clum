@@ -50,7 +50,7 @@ pub fn resolve_program(sources: &mut SourceMap, entry: FileId) -> Result<Program
         loader.load(entry, entry_canon)?;
         loader.modules
     };
-    check_modules(sources, &modules)?;
+    check_modules(sources, entry, &modules)?;
     Ok(Program { entry, modules })
 }
 
@@ -181,14 +181,36 @@ fn binding_name(binding: &Binding) -> &Name {
     }
 }
 
-fn check_modules(sources: &SourceMap, modules: &[ResolvedModule]) -> Result<(), Diagnostic> {
+fn check_modules(
+    sources: &SourceMap,
+    entry: FileId,
+    modules: &[ResolvedModule],
+) -> Result<(), Diagnostic> {
     let export_of: HashMap<FileId, Option<Name>> = modules
         .iter()
         .map(|module| (module.file, module.export.clone()))
         .collect();
     for module in modules {
+        if module.file != entry {
+            check_no_top_level_exprs(module)?;
+        }
         let mut checker = Checker::new(sources, module.file);
         checker.check(module, &export_of)?;
+    }
+    Ok(())
+}
+
+fn check_no_top_level_exprs(module: &ResolvedModule) -> Result<(), Diagnostic> {
+    for item in &module.module.items {
+        if let Item::Expr(expr) = item {
+            return Err(Diagnostic::error(
+                "エントリポイント以外のファイルのトップレベルに式は書けません",
+            )
+            .at(module.file, expr.span())
+            .with_label(
+                "トップレベルの式を実行できるのはエントリポイントだけです。値が必要なら `名前 = 式` で束縛してください",
+            ));
+        }
     }
     Ok(())
 }
@@ -900,7 +922,7 @@ mod tests {
             &[
                 (
                     "main.clum",
-                    "@ ./index\n  index\n\nRecipe\n  documents:\n    - path: './dist/index.html'\n      element: index\n  |> build\n  |> !\n",
+                    "@./index\n  index\n\nRecipe\n  documents:\n    - path: './dist/index.html'\n      element: index\n  |> build\n  |> !\n",
                 ),
                 ("index.clum", ":pub\nindex: Html = h .div\n"),
             ],
@@ -909,12 +931,30 @@ mod tests {
     }
 
     #[test]
+    fn non_entry_top_level_expr_is_error() {
+        let dir = temp_dir("non-entry-top-expr");
+        let message = resolve_files(
+            &dir.path,
+            &[
+                ("main.clum", "@./index\n  index\n\nx = index\n"),
+                (
+                    "index.clum",
+                    ":pub\nindex: Html = h .div\n\nRecipe\n  documents:\n    - path: './x.html'\n      element: index\n  |> build\n  |> !\n",
+                ),
+            ],
+        )
+        .expect_err("エラーを期待しました");
+        assert!(message.contains("エントリポイント以外のファイルのトップレベルに式は書けません"));
+        assert!(message.contains("index.clum:4:1"));
+    }
+
+    #[test]
     fn import_of_non_export_is_error() {
         let dir = temp_dir("import-notexport");
         let message = resolve_files(
             &dir.path,
             &[
-                ("main.clum", "@ ./index\n  wrong\n\nx = wrong\n"),
+                ("main.clum", "@./index\n  wrong\n\nx = wrong\n"),
                 ("index.clum", ":pub\nindex: Html = h .div\n"),
             ],
         )
@@ -925,7 +965,7 @@ mod tests {
     #[test]
     fn import_missing_file_is_error() {
         let dir = temp_dir("import-missing");
-        let message = resolve_files(&dir.path, &[("main.clum", "@ ./missing\n  x\n\ny = 1\n")])
+        let message = resolve_files(&dir.path, &[("main.clum", "@./missing\n  x\n\ny = 1\n")])
             .expect_err("エラーを期待しました");
         assert!(message.contains("が見つかりません"));
     }
@@ -936,9 +976,9 @@ mod tests {
         let message = resolve_files(
             &dir.path,
             &[
-                ("main.clum", "@ ./a\n  a\n\nx = a\n"),
-                ("a.clum", "@ ./b\n  b\n\n:pub\na: Html = h .div\n  {b}\n"),
-                ("b.clum", "@ ./a\n  a\n\n:pub\nb: Html = h .div\n  {a}\n"),
+                ("main.clum", "@./a\n  a\n\nx = a\n"),
+                ("a.clum", "@./b\n  b\n\n:pub\na: Html = h .div\n  {b}\n"),
+                ("b.clum", "@./a\n  a\n\n:pub\nb: Html = h .div\n  {a}\n"),
             ],
         )
         .expect_err("エラーを期待しました");

@@ -10,8 +10,9 @@ syntax match clumTypeName /\v<[A-Z][A-Za-z0-9]*>/
 
 syntax match clumDeclMark /\v^\s*\zs#\ze\s/
 syntax match clumImportMark /\v^\s*\zs\@/
-syntax match clumImportPath /\v%(^\s*\@\s*)@<=\S+/
-syntax match clumExportMark /\v^\s*\zs\^\s*$/
+syntax match clumImportPath /\v%(^\s*\@)@<=\S+/
+syntax match clumExportMark /\v^\zs\^\ze[A-Za-z]/
+syntax match clumExportName /\v%(^\^)@<=[a-z][a-z0-9-]*/
 syntax match clumListMarker /\v^\s*\zs-\ze\s/
 
 syntax match clumOperator "|>"
@@ -46,6 +47,7 @@ highlight default link clumDeclMark PreProc
 highlight default link clumImportMark Include
 highlight default link clumImportPath String
 highlight default link clumExportMark Include
+highlight default link clumExportName Identifier
 highlight default link clumListMarker Special
 highlight default link clumOperator Operator
 highlight default link clumBang Operator

@@ -963,7 +963,7 @@ mod tests {
         fs::write(
             &main_path,
             concat!(
-                "@ ./index\n",
+                "@./index\n",
                 "  index\n",
                 "\n",
                 "Recipe\n",

@@ -1,0 +1,10 @@
+:pub
+index: Html = h .div
+  hello
+
+Recipe
+  documents:
+    - path: './dist/extra.html'
+      element: index
+  |> build
+  |> !

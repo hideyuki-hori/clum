@@ -1183,7 +1183,7 @@ mod tests {
 
     #[test]
     fn import_lists_names() {
-        let module = parse_ok("@ ./index\n  index\n");
+        let module = parse_ok("@./index\n  index\n");
         match &module.items[0] {
             Item::Import(import) => {
                 assert_eq!(import.path.text, "./index");
@@ -1588,7 +1588,7 @@ mod tests {
 
     #[test]
     fn record_construction_with_pipe_and_bang() {
-        let src = "@ ./index\n  index\n\nRecipe\n  documents:\n    - path: './dist/index.html'\n      element: index\n  |> build\n  |> !\n";
+        let src = "@./index\n  index\n\nRecipe\n  documents:\n    - path: './dist/index.html'\n      element: index\n  |> build\n  |> !\n";
         let module = parse_ok(src);
         assert_eq!(module.items.len(), 2);
         match &module.items[1] {
@@ -1676,7 +1676,7 @@ mod tests {
 
     #[test]
     fn err_import_without_names() {
-        let message = parse_error("@ ./index\nx = 1\n");
+        let message = parse_error("@./index\nx = 1\n");
         assert!(message.contains("インデントして列挙"));
     }
 

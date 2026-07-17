@@ -9,6 +9,7 @@
 - @docs/spec/clum-core-spec.md — コア仕様（字句・型・スコープ・実行モデル）
 - @docs/spec/clum-html-spec.md — HTML ターゲット仕様
 - @docs/spec/clum-step1-html.md — **現在のステップのスコープ定義（最優先で読む）**
+- docs/spec/latest.md — 現在形だけのチートシート（経緯なし・派生文書。正は上の各仕様書。仕様を変えたら同じコミットでこの文書も更新する）
 
 ## 仕様変更の手続き（最重要ルール）
 
