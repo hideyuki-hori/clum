@@ -8,7 +8,7 @@ use crate::ast::{
     StrPart, TypeExpr, VecElem,
 };
 use crate::diag::Diagnostic;
-use crate::resolve::{Program, ResolvedModule};
+use crate::resolve::{ImportedKind, ImportedName, Program, ResolvedModule, kebab_of};
 use crate::source::{FileId, SourceMap};
 use crate::span::Span;
 use crate::value::{Closure, Effect, Env, HtmlNode, Origin, RecordValue, UserFn, Value};
@@ -47,22 +47,26 @@ pub fn eval_program(sources: &SourceMap, program: &Program) -> Result<(), Diagno
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| Path::new(".").to_path_buf());
-    let mut exports: HashMap<FileId, Value> = HashMap::new();
+    let modules_by_file: HashMap<FileId, &Module> = program
+        .modules
+        .iter()
+        .map(|resolved| (resolved.file, &resolved.module))
+        .collect();
+    let mut module_values: HashMap<FileId, HashMap<String, Value>> = HashMap::new();
     for resolved in &program.modules {
-        let value = eval_module(resolved, &exports, &base_dir)?;
-        if let Some(value) = value {
-            exports.insert(resolved.file, value);
-        }
+        let own = eval_module(resolved, &module_values, &modules_by_file, &base_dir)?;
+        module_values.insert(resolved.file, own);
     }
     Ok(())
 }
 
 fn eval_module(
     resolved: &ResolvedModule,
-    exports: &HashMap<FileId, Value>,
+    module_values: &HashMap<FileId, HashMap<String, Value>>,
+    modules_by_file: &HashMap<FileId, &Module>,
     base_dir: &Path,
-) -> Result<Option<Value>, Diagnostic> {
-    let vec_tail = Rc::new(build_vec_tail_map(&resolved.module));
+) -> Result<HashMap<String, Value>, Diagnostic> {
+    let vec_tail = Rc::new(build_vec_tail_map(resolved, modules_by_file));
     let ctx = Ctx {
         base_dir,
         file: resolved.file,
@@ -71,35 +75,75 @@ fn eval_module(
 
     let mut import_vars = HashMap::new();
     for import in &resolved.imports {
-        for name in &import.names {
-            let value = exports.get(&import.file).cloned().ok_or_else(|| {
-                ctx.err(
-                    format!("import した `{}` の値が求まっていません", name.text),
-                    name.span,
-                )
-            })?;
-            import_vars.insert(name.text.clone(), value);
+        for imported in &import.names {
+            inject_imported(&mut import_vars, imported, module_values, &ctx)?;
         }
     }
     let mut env = prelude_env().child(import_vars);
 
-    let mut export_value = None;
+    let mut own = HashMap::new();
     for item in &resolved.module.items {
         match item {
             Item::Decl(_) | Item::Import(_) => {}
             Item::Binding(binding) => {
                 env = eval_binding(binding, &env, &ctx)?;
-                if binding.is_pub {
-                    let name = binding_name(binding);
-                    export_value = env.lookup(&name.text);
+                let name = binding_name(binding);
+                if let Some(value) = env.lookup(&name.text) {
+                    own.insert(name.text.clone(), value);
+                }
+                if let BindingKind::Impl { def, .. } = &binding.kind
+                    && let Some(value) = env.lookup(&def.text)
+                {
+                    own.insert(def.text.clone(), value);
                 }
             }
             Item::Expr(expr) => {
-                eval_expr(expr, &env, &ctx)?;
+                if resolved.is_entry {
+                    eval_expr(expr, &env, &ctx)?;
+                }
             }
         }
     }
-    Ok(export_value)
+    Ok(own)
+}
+
+fn inject_imported(
+    import_vars: &mut HashMap<String, Value>,
+    imported: &ImportedName,
+    module_values: &HashMap<FileId, HashMap<String, Value>>,
+    ctx: &Ctx,
+) -> Result<(), Diagnostic> {
+    let origin_values = module_values.get(&imported.origin);
+    match &imported.kind {
+        ImportedKind::Value { source } => {
+            let value = origin_values
+                .and_then(|values| values.get(source))
+                .cloned()
+                .ok_or_else(|| {
+                    ctx.err(
+                        format!("`{}` の値が求まっていません", imported.name.text),
+                        imported.name.span,
+                    )
+                })?;
+            import_vars.insert(imported.name.text.clone(), value);
+        }
+        ImportedKind::Decl { source_impl, .. } => {
+            if let Some(source_impl) = source_impl {
+                let value = origin_values
+                    .and_then(|values| values.get(source_impl))
+                    .cloned()
+                    .ok_or_else(|| {
+                        ctx.err(
+                            format!("`{}` の実装の値が求まっていません", imported.name.text),
+                            imported.name.span,
+                        )
+                    })?;
+                import_vars.insert(imported.name.text.clone(), value.clone());
+                import_vars.insert(kebab_of(&imported.name.text), value);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn prelude_env() -> Env {
@@ -133,8 +177,12 @@ fn last_param_is_vec_html(decl: &Decl) -> bool {
         .unwrap_or(false)
 }
 
-fn build_vec_tail_map(module: &Module) -> HashMap<String, bool> {
-    module
+fn build_vec_tail_map(
+    resolved: &ResolvedModule,
+    modules_by_file: &HashMap<FileId, &Module>,
+) -> HashMap<String, bool> {
+    let mut map: HashMap<String, bool> = resolved
+        .module
         .items
         .iter()
         .filter_map(|item| match item {
@@ -143,7 +191,28 @@ fn build_vec_tail_map(module: &Module) -> HashMap<String, bool> {
             }
             _ => None,
         })
-        .collect()
+        .collect();
+    let imported_names = resolved
+        .imports
+        .iter()
+        .flat_map(|import| import.names.iter());
+    for imported in imported_names {
+        let ImportedKind::Decl { source_decl, .. } = &imported.kind else {
+            continue;
+        };
+        let Some(module) = modules_by_file.get(&imported.origin) else {
+            continue;
+        };
+        for item in &module.items {
+            if let Item::Decl(decl) = item
+                && decl.name.text == *source_decl
+                && decl.ret.is_some()
+            {
+                map.insert(imported.name.text.clone(), last_param_is_vec_html(decl));
+            }
+        }
+    }
+    map
 }
 
 fn eval_binding(binding: &Binding, env: &Env, ctx: &Ctx) -> Result<Env, Diagnostic> {
@@ -617,36 +686,45 @@ mod tests {
     }
 
     fn temp_dir(tag: &str) -> TmpDir {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = env::temp_dir().join(format!("clum-eval-{tag}-{}-{nanos}", std::process::id()));
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = env::temp_dir().join(format!("clum-eval-{tag}-{}-{unique}", std::process::id()));
         fs::create_dir_all(&path).unwrap();
         TmpDir { path }
     }
 
-    fn build_single(src: &str) -> Result<Value, Diagnostic> {
+    fn checked_program(dir: &Path) -> (SourceMap, crate::resolve::Program) {
         let mut sources = SourceMap::new();
-        let file = sources.add_file(PathBuf::from("main.clum"), src.to_string());
-        let program = resolve_program(&mut sources, file).expect("resolve に成功する前提です");
-        check_program(&program).expect("型検査に成功する前提です");
-        let base_dir = PathBuf::from(".");
-        let mut exports = HashMap::new();
-        let resolved = &program.modules[0];
-        eval_module(resolved, &exports, &base_dir).map(|value| {
-            let value = value.expect("export を期待しました");
-            exports.insert(resolved.file, value.clone());
-            value
-        })
+        let program = resolve_program(&mut sources, dir).unwrap_or_else(|diagnostic| {
+            panic!(
+                "resolve に成功する前提です: {}",
+                diagnostic.render(&sources)
+            )
+        });
+        check_program(&program).unwrap_or_else(|diagnostic| {
+            panic!("型検査に成功する前提です: {}", diagnostic.render(&sources))
+        });
+        (sources, program)
     }
 
-    fn eval_ok(src: &str) -> Value {
-        build_single(src).unwrap_or_else(|diagnostic| {
-            let mut sources = SourceMap::new();
-            sources.add_file(PathBuf::from("main.clum"), src.to_string());
-            panic!("評価に成功する前提です: {}", diagnostic.render(&sources))
-        })
+    fn eval_value(src: &str, name: &str) -> Value {
+        let dir = temp_dir("value");
+        fs::write(dir.path.join("_.clum"), src).unwrap();
+        let (sources, program) = checked_program(&dir.path);
+        let modules_by_file: HashMap<FileId, &Module> = program
+            .modules
+            .iter()
+            .map(|resolved| (resolved.file, &resolved.module))
+            .collect();
+        let mut module_values: HashMap<FileId, HashMap<String, Value>> = HashMap::new();
+        for resolved in &program.modules {
+            let own = eval_module(resolved, &module_values, &modules_by_file, &dir.path)
+                .unwrap_or_else(|diagnostic| {
+                    panic!("評価に成功する前提です: {}", diagnostic.render(&sources))
+                });
+            module_values.insert(resolved.file, own);
+        }
+        module_values[&program.entry][name].clone()
     }
 
     fn as_str(value: &Value) -> String {
@@ -669,10 +747,9 @@ mod tests {
             "# Cat a: String, b: String -> String\n",
             "cat: Cat a, b -> a\n",
             "partial = cat 'first'\n",
-            ":pub\n",
             "x: String = partial 'second'\n",
         );
-        assert_eq!(as_str(&eval_ok(src)), "first");
+        assert_eq!(as_str(&eval_value(src, "x")), "first");
     }
 
     #[test]
@@ -680,10 +757,9 @@ mod tests {
         let src = concat!(
             "# Cat a: String, b: String -> String\n",
             "cat: Cat a, b -> b\n",
-            ":pub\n",
             "x: String = 'tail' |> cat 'head'\n",
         );
-        assert_eq!(as_str(&eval_ok(src)), "tail");
+        assert_eq!(as_str(&eval_value(src, "x")), "tail");
     }
 
     #[test]
@@ -693,10 +769,9 @@ mod tests {
             "page: Page = Page\n",
             "  path: './a'\n",
             "  title: 'A'\n",
-            ":pub\n",
             "x: String = '{page.title} です'\n",
         );
-        assert_eq!(as_str(&eval_ok(src)), "A です");
+        assert_eq!(as_str(&eval_value(src, "x")), "A です");
     }
 
     #[test]
@@ -706,10 +781,9 @@ mod tests {
             "  - 1\n",
             "  - 2\n",
             "  - 3\n",
-            ":pub\n",
             "ys: Vec<String> = xs |> map n -> '{n}!'\n",
         );
-        match eval_ok(src) {
+        match eval_value(src, "ys") {
             Value::Vec(items) => {
                 let rendered: Vec<String> = items.iter().map(as_str).collect();
                 assert_eq!(rendered, vec!["1!", "2!", "3!"]);
@@ -722,12 +796,11 @@ mod tests {
     fn record_construction_builds_fields() {
         let src = concat!(
             "# Page path: String, title: String\n",
-            ":pub\n",
             "page: Page = Page\n",
             "  path: './a'\n",
             "  title: 'A'\n",
         );
-        match eval_ok(src) {
+        match eval_value(src, "page") {
             Value::Record(record) => {
                 assert_eq!(as_str(record.field("path").unwrap()), "./a");
                 assert_eq!(as_str(record.field("title").unwrap()), "A");
@@ -740,14 +813,13 @@ mod tests {
     fn vec_literal_of_records() {
         let src = concat!(
             "# Page path: String, title: String\n",
-            ":pub\n",
             "pages: Vec<Page> =\n",
             "  - path: './a'\n",
             "    title: 'A'\n",
             "  - path: './b'\n",
             "    title: 'B'\n",
         );
-        match eval_ok(src) {
+        match eval_value(src, "pages") {
             Value::Vec(items) => {
                 assert_eq!(items.len(), 2);
                 match &items[0] {
@@ -763,8 +835,8 @@ mod tests {
 
     #[test]
     fn html_tree_with_attributes_and_text() {
-        let src = ":pub\nx: Html = h .a href '/about'\n  about\n";
-        match as_html(&eval_ok(src)) {
+        let src = "x: Html = h .a href '/about'\n  about\n";
+        match as_html(&eval_value(src, "x")) {
             HtmlNode::Element {
                 tag,
                 attrs,
@@ -787,8 +859,8 @@ mod tests {
 
     #[test]
     fn boolean_attribute_has_no_value() {
-        let src = ":pub\nx: Html = h .input type 'text', disabled\n";
-        match as_html(&eval_ok(src)) {
+        let src = "x: Html = h .input type 'text', disabled\n";
+        match as_html(&eval_value(src, "x")) {
             HtmlNode::Element { attrs, .. } => {
                 assert_eq!(attrs[1], ("disabled".to_string(), None));
             }
@@ -809,11 +881,10 @@ mod tests {
             "  |> map page ->\n",
             "    h .li\n",
             "      {page.title}\n",
-            ":pub\n",
             "x: Html = h .ul\n",
             "  {items}\n",
         );
-        match as_html(&eval_ok(src)) {
+        match as_html(&eval_value(src, "x")) {
             HtmlNode::Element { tag, children, .. } => {
                 assert_eq!(tag, "ul");
                 assert_eq!(children.len(), 2);
@@ -835,13 +906,12 @@ mod tests {
             "card: Card title, body -> h .div\n",
             "  {title}\n",
             "  {body}\n",
-            ":pub\n",
             "page: Html = h .body\n",
             "  Card 'お知らせ'\n",
             "    h .p\n",
             "      本文\n",
         );
-        match as_html(&eval_ok(src)) {
+        match as_html(&eval_value(src, "page")) {
             HtmlNode::Element { children, .. } => match &children[0] {
                 HtmlNode::Element { children, .. } => {
                     assert_eq!(children.len(), 2);
@@ -866,7 +936,6 @@ mod tests {
             "# Card title: String, body: Vec<Html> -> Html\n",
             "card: Card title, body -> h .div\n",
             "  {body}\n",
-            ":pub\n",
             "page: Html = h .body\n",
             "  Card 'お知らせ'\n",
             "    h .p\n",
@@ -874,7 +943,7 @@ mod tests {
             "    h .p\n",
             "      追伸\n",
         );
-        match as_html(&eval_ok(src)) {
+        match as_html(&eval_value(src, "page")) {
             HtmlNode::Element { children, .. } => match &children[0] {
                 HtmlNode::Element { children, .. } => {
                     assert_eq!(children.len(), 2);
@@ -894,9 +963,7 @@ mod tests {
     #[test]
     fn top_level_bang_runs_in_order() {
         let dir = temp_dir("order");
-        let main_path = dir.path.join("main.clum");
         let src = concat!(
-            ":pub\n",
             "index: Html = h .html\n",
             "\n",
             "Recipe\n",
@@ -906,13 +973,9 @@ mod tests {
             "  |> build\n",
             "  |> !\n",
         );
-        fs::write(&main_path, src).unwrap();
+        fs::write(dir.path.join("_.clum"), src).unwrap();
 
-        let mut sources = SourceMap::new();
-        let content = fs::read_to_string(&main_path).unwrap();
-        let file = sources.add_file(main_path.clone(), content);
-        let program = resolve_program(&mut sources, file).expect("resolve に成功する前提です");
-        check_program(&program).expect("型検査に成功する前提です");
+        let (sources, program) = checked_program(&dir.path);
         eval_program(&sources, &program).expect("評価に成功する前提です");
 
         let output = fs::read_to_string(dir.path.join("dist/index.html")).unwrap();
@@ -923,9 +986,7 @@ mod tests {
     #[test]
     fn build_writes_multiple_documents() {
         let dir = temp_dir("multi");
-        let main_path = dir.path.join("main.clum");
         let src = concat!(
-            ":pub\n",
             "index: Html = h .div\n",
             "  一\n",
             "\n",
@@ -938,13 +999,9 @@ mod tests {
             "  |> build\n",
             "  |> !\n",
         );
-        fs::write(&main_path, src).unwrap();
+        fs::write(dir.path.join("_.clum"), src).unwrap();
 
-        let mut sources = SourceMap::new();
-        let content = fs::read_to_string(&main_path).unwrap();
-        let file = sources.add_file(main_path.clone(), content);
-        let program = resolve_program(&mut sources, file).expect("resolve に成功する前提です");
-        check_program(&program).expect("型検査に成功する前提です");
+        let (sources, program) = checked_program(&dir.path);
         eval_program(&sources, &program).expect("評価に成功する前提です");
 
         assert!(dir.path.join("dist/a.html").is_file());
@@ -956,12 +1013,11 @@ mod tests {
         let dir = temp_dir("import");
         fs::write(
             dir.path.join("index.clum"),
-            ":pub\nindex: Html = h .div\n  中身\n",
+            "^index: Html = h .div\n  中身\n",
         )
         .unwrap();
-        let main_path = dir.path.join("main.clum");
         fs::write(
-            &main_path,
+            dir.path.join("_.clum"),
             concat!(
                 "@./index\n",
                 "  index\n",
@@ -976,14 +1032,99 @@ mod tests {
         )
         .unwrap();
 
-        let mut sources = SourceMap::new();
-        let content = fs::read_to_string(&main_path).unwrap();
-        let file = sources.add_file(main_path.clone(), content);
-        let program = resolve_program(&mut sources, file).expect("resolve に成功する前提です");
-        check_program(&program).expect("型検査に成功する前提です");
+        let (sources, program) = checked_program(&dir.path);
         eval_program(&sources, &program).expect("評価に成功する前提です");
 
         let output = fs::read_to_string(dir.path.join("dist/index.html")).unwrap();
         assert!(output.contains("中身"));
+    }
+
+    #[test]
+    fn imported_component_renders_across_files() {
+        let dir = temp_dir("component-across");
+        fs::write(
+            dir.path.join("card.clum"),
+            concat!(
+                "^# Card title: String, body: Vec<Html> -> Html\n",
+                "card: Card title, body -> h .section\n",
+                "  {title}\n",
+                "  {body}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.path.join("_.clum"),
+            concat!(
+                "@./card\n",
+                "  Card\n",
+                "\n",
+                "index: Html = h .body\n",
+                "  Card 'お知らせ'\n",
+                "    h .p\n",
+                "      本文\n",
+                "\n",
+                "Recipe\n",
+                "  documents:\n",
+                "    - path: './dist/index.html'\n",
+                "      element: index\n",
+                "  |> build\n",
+                "  |> !\n",
+            ),
+        )
+        .unwrap();
+
+        let (sources, program) = checked_program(&dir.path);
+        eval_program(&sources, &program).expect("評価に成功する前提です");
+
+        let output = fs::read_to_string(dir.path.join("dist/index.html")).unwrap();
+        assert!(output.contains("<section>お知らせ<p>本文</p></section>"));
+    }
+
+    #[test]
+    fn imported_window_exprs_do_not_run() {
+        let dir = temp_dir("window-no-run");
+        fs::create_dir_all(dir.path.join("lib")).unwrap();
+        fs::write(
+            dir.path.join("lib/page.clum"),
+            "^page: Html = h .div\n  中身\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path.join("lib/_.clum"),
+            concat!(
+                "^@./page\n",
+                "  page\n",
+                "\n",
+                "Recipe\n",
+                "  documents:\n",
+                "    - path: './never.html'\n",
+                "      element: page\n",
+                "  |> build\n",
+                "  |> !\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.path.join("_.clum"),
+            concat!(
+                "@./lib\n",
+                "  page\n",
+                "\n",
+                "Recipe\n",
+                "  documents:\n",
+                "    - path: './dist/index.html'\n",
+                "      element: page\n",
+                "  |> build\n",
+                "  |> !\n",
+            ),
+        )
+        .unwrap();
+
+        let (sources, program) = checked_program(&dir.path);
+        eval_program(&sources, &program).expect("評価に成功する前提です");
+
+        assert!(dir.path.join("dist/index.html").is_file());
+        assert!(!dir.path.join("lib/never.html").exists());
+        assert!(!dir.path.join("never.html").exists());
     }
 }

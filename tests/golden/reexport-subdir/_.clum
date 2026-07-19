@@ -1,0 +1,14 @@
+@./ui
+  Card
+
+index: Html = h .body
+  Card 'x'
+    h .p
+      本文
+
+Recipe
+  documents:
+    - path: './dist/index.html'
+      element: index
+  |> build
+  |> !

@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 use std::mem::discriminant;
 
 use crate::ast::{
-    Attr, Binding, BindingKind, Child, Component, Decl, Element, Expr, Field, Import, Item, Module,
-    Name, RecordField, StrPart, TypeExpr, VecElem,
+    Attr, Binding, BindingKind, Child, Component, Decl, Element, Expr, Field, Import, ImportEntry,
+    Item, Module, Name, RecordField, StrPart, TypeExpr, VecElem,
 };
 use crate::diag::Diagnostic;
 use crate::lexer::{Lexer, LineHead};
@@ -100,11 +100,9 @@ impl<'a> Parser<'a> {
             let token = self.peek(0)?;
             match &token.kind {
                 TokenKind::Eof => break,
-                TokenKind::Hash => items.push(Item::Decl(self.parse_decl()?)),
-                TokenKind::At => items.push(Item::Import(self.parse_import()?)),
-                TokenKind::ColonWord(word) if word == "pub" => {
-                    items.push(Item::Binding(self.parse_pub_binding()?));
-                }
+                TokenKind::Hash => items.push(Item::Decl(self.parse_decl(false)?)),
+                TokenKind::At => items.push(Item::Import(self.parse_import(false)?)),
+                TokenKind::Caret => items.push(self.parse_exposed()?),
                 TokenKind::Ident(_) => items.push(Item::Binding(self.parse_binding(false)?)),
                 TokenKind::UpperIdent(_) => {
                     items.push(Item::Expr(self.parse_record_construction()?))
@@ -118,7 +116,36 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_decl(&mut self) -> Result<Decl, Diagnostic> {
+    fn parse_exposed(&mut self) -> Result<Item, Diagnostic> {
+        let caret = self.bump()?;
+        let token = self.peek(0)?;
+        if token.span.start != caret.span.end {
+            return Err(self
+                .err(
+                    "`^` と続く定義のあいだに空白は書けません",
+                    Span::new(caret.span.end, token.span.start),
+                )
+                .with_label("`^` は定義に密着させます（例: `^index: Html = ...`、`^# Card ...`、`^@./sub`）"));
+        }
+        match &token.kind {
+            TokenKind::Hash => Ok(Item::Decl(self.parse_decl(true)?)),
+            TokenKind::At => Ok(Item::Import(self.parse_import(true)?)),
+            TokenKind::Ident(_) => Ok(Item::Binding(self.parse_binding(true)?)),
+            TokenKind::UpperIdent(text) => Err(self
+                .err(
+                    format!("`^{text}` の行形式は廃止されました"),
+                    Span::new(caret.span.start, token.span.end),
+                )
+                .with_label("`#` 宣言の公開は宣言自身に前置します（`^# Card ...`）")),
+            _ => Err(self
+                .err("`^` の後には公開する定義が必要です", token.span)
+                .with_label(
+                    "`^名前: 型 = 式`（値）・`^# Name ...`（宣言）・`^@パス`（窓口の公開面）のいずれかです",
+                )),
+        }
+    }
+
+    fn parse_decl(&mut self, exposed: bool) -> Result<Decl, Diagnostic> {
         let hash = self.bump()?;
         let name = self.expect_upper("`#` の後には定義名（大文字始まり）が必要です")?;
         let mut params = Vec::new();
@@ -157,6 +184,7 @@ impl<'a> Parser<'a> {
             None => params.last().unwrap().span.end,
         };
         Ok(Decl {
+            exposed,
             name,
             params,
             ret,
@@ -193,21 +221,25 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_import(&mut self) -> Result<Import, Diagnostic> {
+    fn parse_import(&mut self, reexport: bool) -> Result<Import, Diagnostic> {
         let at = self.bump()?;
+        let what = if reexport { "公開" } else { "import" };
         let path_token = self.peek(0)?;
         let path = match path_token.kind {
             TokenKind::Path(text) => {
                 self.bump()?;
                 Name::new(text, path_token.span)
             }
-            _ => return Err(self.err("import するパスが必要です", path_token.span)),
+            _ => return Err(self.err(format!("{what}するパスが必要です"), path_token.span)),
         };
-        self.expect(&TokenKind::Newline, "import パスのあとは改行してください")?;
+        self.expect(
+            &TokenKind::Newline,
+            &format!("{what}パスのあとは改行してください"),
+        )?;
         let indent = self.peek(0)?;
         if !matches!(indent.kind, TokenKind::Indent) {
             return Err(self.err(
-                "import する名前をインデントして列挙してください",
+                format!("{what}する名前をインデントして列挙してください"),
                 indent.span,
             ));
         }
@@ -215,52 +247,87 @@ impl<'a> Parser<'a> {
         let mut names = Vec::new();
         loop {
             let token = self.peek(0)?;
-            match token.kind {
-                TokenKind::Ident(text) => {
+            let first = match &token.kind {
+                TokenKind::Ident(text) | TokenKind::UpperIdent(text) => {
+                    let name = Name::new(text.clone(), token.span);
                     self.bump()?;
-                    names.push(Name::new(text, token.span));
-                }
-                TokenKind::UpperIdent(text) => {
-                    self.bump()?;
-                    names.push(Name::new(text, token.span));
+                    name
                 }
                 TokenKind::Dedent => {
                     self.bump()?;
                     break;
                 }
-                _ => return Err(self.err("import する名前（識別子）が必要です", token.span)),
-            }
-            self.expect(&TokenKind::Newline, "import する名前は1行に1つ書きます")?;
+                _ => {
+                    return Err(self.err(format!("{what}する名前（識別子）が必要です"), token.span));
+                }
+            };
+            let entry = if matches!(self.peek(0)?.kind, TokenKind::Eq) {
+                self.bump()?;
+                let source_token = self.peek(0)?;
+                let source = match &source_token.kind {
+                    TokenKind::Ident(text) | TokenKind::UpperIdent(text) => {
+                        let name = Name::new(text.clone(), source_token.span);
+                        self.bump()?;
+                        name
+                    }
+                    _ => {
+                        return Err(self
+                            .err("`=` の右には元の名前が必要です", source_token.span)
+                            .with_label("別名は `新名 = 元名` の形で書きます"));
+                    }
+                };
+                if is_upper_name(&first) != is_upper_name(&source) {
+                    return Err(self
+                        .err(
+                            "別名は元の名前と同じ命名カテゴリで書きます",
+                            Span::new(first.span.start, source.span.end),
+                        )
+                        .with_label(
+                            "定義名（UpperCamelCase）の別名は UpperCamelCase、値（lower-kebab-case）の別名は lower-kebab-case です",
+                        ));
+                }
+                ImportEntry {
+                    name: first,
+                    source,
+                }
+            } else {
+                ImportEntry {
+                    name: first.clone(),
+                    source: first,
+                }
+            };
+            names.push(entry);
+            self.expect(
+                &TokenKind::Newline,
+                &format!("{what}する名前は1行に1つ書きます"),
+            )?;
         }
         if names.is_empty() {
-            return Err(self.err("import する名前が1つもありません", at.span));
+            return Err(self.err(format!("{what}する名前が1つもありません"), at.span));
         }
-        let end = names.last().unwrap().span.end;
+        let end = names.last().unwrap().source.span.end;
         Ok(Import {
+            reexport,
             path,
             names,
             span: Span::new(at.span.start, end),
         })
     }
 
-    fn parse_pub_binding(&mut self) -> Result<Binding, Diagnostic> {
-        let pub_token = self.bump()?;
-        self.expect(&TokenKind::Newline, "`:pub` は単独の行に書きます")?;
-        let next = self.peek(0)?;
-        if !matches!(next.kind, TokenKind::Ident(_)) {
-            return Err(self.err("`:pub` の直後には束縛が必要です", next.span));
-        }
-        let mut binding = self.parse_binding(true)?;
-        if let BindingKind::Value { ty: None, name, .. } = &binding.kind {
-            return Err(self.err("`:pub` を付ける値束縛には型注釈が必要です", name.span));
-        }
-        binding.span = Span::new(pub_token.span.start, binding.span.end);
-        Ok(binding)
-    }
-
-    fn parse_binding(&mut self, is_pub: bool) -> Result<Binding, Diagnostic> {
+    fn parse_binding(&mut self, exposed: bool) -> Result<Binding, Diagnostic> {
         let name = self.expect_ident("束縛名が必要です")?;
         let start = name.span.start;
+        if exposed && matches!(self.peek(0)?.kind, TokenKind::Newline) {
+            return Err(self
+                .err(
+                    format!("`^{}` の行形式は廃止されました", name.text),
+                    Span::new(start - 1, name.span.end),
+                )
+                .with_label(format!(
+                    "定義に直接 `^` を前置します（例: `^{}: Html = ...`）。窓口からの公開は `^@.` ブロックで書きます",
+                    name.text
+                )));
+        }
         let token = self.peek(0)?;
         match token.kind {
             TokenKind::Eq => {
@@ -268,7 +335,7 @@ impl<'a> Parser<'a> {
                 let value = self.parse_expr_value()?;
                 let span = Span::new(start, value.span().end);
                 Ok(Binding {
-                    is_pub,
+                    exposed,
                     kind: BindingKind::Value {
                         name,
                         ty: None,
@@ -279,7 +346,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Colon => {
                 self.bump()?;
-                self.parse_binding_after_colon(is_pub, name, start)
+                self.parse_binding_after_colon(exposed, name, start)
             }
             _ => Err(self.err("束縛には `=` か `:` が必要です", token.span)),
         }
@@ -287,7 +354,7 @@ impl<'a> Parser<'a> {
 
     fn parse_binding_after_colon(
         &mut self,
-        is_pub: bool,
+        exposed: bool,
         name: Name,
         start: usize,
     ) -> Result<Binding, Diagnostic> {
@@ -306,7 +373,7 @@ impl<'a> Parser<'a> {
                 let value = self.parse_expr_value()?;
                 let span = Span::new(start, value.span().end);
                 Ok(Binding {
-                    is_pub,
+                    exposed,
                     kind: BindingKind::Value {
                         name,
                         ty: Some(ty),
@@ -324,7 +391,7 @@ impl<'a> Parser<'a> {
                 let value = self.parse_expr_value()?;
                 let span = Span::new(start, value.span().end);
                 Ok(Binding {
-                    is_pub,
+                    exposed,
                     kind: BindingKind::Value {
                         name,
                         ty: Some(ty),
@@ -350,7 +417,7 @@ impl<'a> Parser<'a> {
                 let body = self.parse_arrow_body()?;
                 let span = Span::new(start, body.span().end);
                 Ok(Binding {
-                    is_pub,
+                    exposed,
                     kind: BindingKind::Impl {
                         name,
                         def: head_name,
@@ -1091,6 +1158,14 @@ fn decode_braces(raw: &str) -> String {
     out
 }
 
+fn is_upper_name(name: &Name) -> bool {
+    name.text
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_uppercase())
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1188,7 +1263,7 @@ mod tests {
             Item::Import(import) => {
                 assert_eq!(import.path.text, "./index");
                 assert_eq!(import.names.len(), 1);
-                assert_eq!(import.names[0].text, "index");
+                assert_eq!(import.names[0].name.text, "index");
             }
             other => panic!("Import を期待しましたが {other:?} でした"),
         }
@@ -1580,10 +1655,93 @@ mod tests {
     }
 
     #[test]
-    fn pub_binding_sets_flag() {
-        let module = parse_ok(":pub\nindex: Html = h .div\n");
-        let binding = only_binding(&module);
-        assert!(binding.is_pub);
+    fn exposed_binding_parses() {
+        let module = parse_ok("^index: Html = h .div\n");
+        match &module.items[0] {
+            Item::Binding(binding) => assert!(binding.exposed),
+            other => panic!("Binding を期待しましたが {other:?} でした"),
+        }
+    }
+
+    #[test]
+    fn exposed_decl_parses() {
+        let module = parse_ok("^# Card title: String -> Html\ncard: Card title -> h .div\n");
+        match &module.items[0] {
+            Item::Decl(decl) => {
+                assert!(decl.exposed);
+                assert_eq!(decl.name.text, "Card");
+            }
+            other => panic!("Decl を期待しましたが {other:?} でした"),
+        }
+    }
+
+    #[test]
+    fn reexport_block_parses() {
+        let module = parse_ok("^@.\n  index\n  Kado = Card\n");
+        match &module.items[0] {
+            Item::Import(import) => {
+                assert!(import.reexport);
+                assert_eq!(import.path.text, ".");
+                assert_eq!(import.names.len(), 2);
+                assert_eq!(import.names[0].name.text, "index");
+                assert_eq!(import.names[0].source.text, "index");
+                assert_eq!(import.names[1].name.text, "Kado");
+                assert_eq!(import.names[1].source.text, "Card");
+            }
+            other => panic!("Import を期待しましたが {other:?} でした"),
+        }
+    }
+
+    #[test]
+    fn import_alias_parses() {
+        let module = parse_ok("@./lib\n  db = client\n\nx = db\n");
+        match &module.items[0] {
+            Item::Import(import) => {
+                assert!(!import.reexport);
+                assert_eq!(import.names[0].name.text, "db");
+                assert_eq!(import.names[0].source.text, "client");
+            }
+            other => panic!("Import を期待しましたが {other:?} でした"),
+        }
+    }
+
+    #[test]
+    fn err_alias_category_mismatch() {
+        let message = parse_error("@./lib\n  Db = client\n\nx = 1\n");
+        assert!(message.contains("別名は元の名前と同じ命名カテゴリで書きます"));
+    }
+
+    #[test]
+    fn err_caret_with_space() {
+        let message = parse_error("^ index: Html = h .div\n");
+        assert!(message.contains("`^` と続く定義のあいだに空白は書けません"));
+    }
+
+    #[test]
+    fn err_caret_without_definition() {
+        let message = parse_error("^\n");
+        assert!(message.contains("`^` の後には公開する定義が必要です"));
+    }
+
+    #[test]
+    fn err_caret_line_form_abolished() {
+        let message = parse_error("^index\nindex: Html = h .div\n");
+        assert!(message.contains("`^index` の行形式は廃止されました"));
+        assert!(message.contains("^index: Html"));
+    }
+
+    #[test]
+    fn err_caret_upper_line_form_abolished() {
+        let message = parse_error("^Card\n# Card title: String -> Html\n");
+        assert!(message.contains("`^Card` の行形式は廃止されました"));
+        assert!(message.contains("^# Card"));
+    }
+
+    #[test]
+    fn err_pub_is_abolished() {
+        let message = parse_error(":pub\nindex: Html = h .div\n");
+        assert!(message.contains("`:pub` は廃止されました"));
+        assert!(message.contains("^名前"));
     }
 
     #[test]
@@ -1615,8 +1773,7 @@ mod tests {
             "      h .a href page.path\n",
             "        {page.title}\n",
             "\n",
-            ":pub\n",
-            "index: Html = h .html\n",
+            "^index: Html = h .html\n",
             "  h .head\n",
             "    h .meta charset 'utf-8'\n",
             "    h .title\n",
@@ -1629,7 +1786,7 @@ mod tests {
         assert_eq!(module.items.len(), 2);
         match &module.items[1] {
             Item::Binding(binding) => {
-                assert!(binding.is_pub);
+                assert!(binding.exposed);
                 match value_of(binding) {
                     Expr::Element(html) => {
                         assert_eq!(html.tag.text, "html");
@@ -1678,18 +1835,6 @@ mod tests {
     fn err_import_without_names() {
         let message = parse_error("@./index\nx = 1\n");
         assert!(message.contains("インデントして列挙"));
-    }
-
-    #[test]
-    fn err_pub_followed_by_non_binding() {
-        let message = parse_error(":pub\n# Foo x: i32\n");
-        assert!(message.contains("`:pub` の直後には束縛"));
-    }
-
-    #[test]
-    fn err_pub_value_without_annotation() {
-        let message = parse_error(":pub\nindex = h .div\n");
-        assert!(message.contains("型注釈が必要"));
     }
 
     #[test]

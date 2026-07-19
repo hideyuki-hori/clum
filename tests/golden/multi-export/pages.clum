@@ -1,0 +1,4 @@
+^home: Html = h .div
+  ホーム
+^about: Html = h .div
+  アバウト

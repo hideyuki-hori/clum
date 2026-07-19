@@ -12,8 +12,7 @@ items = pages
       h .a href page.path
         {page.title}
 
-:pub
-index: Html = h .html
+^index: Html = h .html
   h .head
     h .meta charset 'utf-8'
     h .title

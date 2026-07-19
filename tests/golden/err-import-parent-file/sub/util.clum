@@ -1,0 +1,5 @@
+@../page
+  index
+
+^x: Html = h .div
+  {index}

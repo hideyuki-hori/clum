@@ -6,21 +6,24 @@ use crate::ast::{
 };
 use crate::diag::Diagnostic;
 use crate::prelude::{self, AttrKind};
-use crate::resolve::{Program, ResolvedModule};
+use crate::resolve::{ImportedKind, ImportedName, Program, ResolvedModule, kebab_of};
 use crate::source::FileId;
 use crate::span::Span;
 use crate::ty::Ty;
 
 pub fn check_program(program: &Program) -> Result<Vec<Diagnostic>, Diagnostic> {
     let mut warnings = Vec::new();
-    let mut export_tys: HashMap<FileId, Ty> = HashMap::new();
+    let mut module_decls: HashMap<FileId, HashMap<String, DeclInfo>> = HashMap::new();
+    let mut module_tys: HashMap<FileId, HashMap<String, Ty>> = HashMap::new();
     for module in &program.modules {
-        let mut checker = Checker::new(module.file, &export_tys);
-        let export = checker.run(module)?;
-        warnings.append(&mut checker.warnings);
-        if let Some(ty) = export {
-            export_tys.insert(module.file, ty);
-        }
+        let (decls, tys, mut module_warnings) = {
+            let mut checker = Checker::new(module.file, &module_decls, &module_tys);
+            checker.run(module)?;
+            (checker.decls, checker.top_tys, checker.warnings)
+        };
+        warnings.append(&mut module_warnings);
+        module_decls.insert(module.file, decls);
+        module_tys.insert(module.file, tys);
     }
     Ok(warnings)
 }
@@ -33,32 +36,94 @@ enum DeclInfo {
 
 struct Checker<'a> {
     file: FileId,
-    export_tys: &'a HashMap<FileId, Ty>,
+    module_decls: &'a HashMap<FileId, HashMap<String, DeclInfo>>,
+    module_tys: &'a HashMap<FileId, HashMap<String, Ty>>,
     decl_kinds: HashMap<String, bool>,
     decls: HashMap<String, DeclInfo>,
     scopes: Vec<HashMap<String, Ty>>,
-    export_ty: Option<Ty>,
+    top_tys: HashMap<String, Ty>,
     warnings: Vec<Diagnostic>,
 }
 
 impl<'a> Checker<'a> {
-    fn new(file: FileId, export_tys: &'a HashMap<FileId, Ty>) -> Self {
+    fn new(
+        file: FileId,
+        module_decls: &'a HashMap<FileId, HashMap<String, DeclInfo>>,
+        module_tys: &'a HashMap<FileId, HashMap<String, Ty>>,
+    ) -> Self {
         Self {
             file,
-            export_tys,
+            module_decls,
+            module_tys,
             decl_kinds: HashMap::new(),
             decls: HashMap::new(),
             scopes: vec![HashMap::new()],
-            export_ty: None,
+            top_tys: HashMap::new(),
             warnings: Vec::new(),
         }
     }
 
-    fn run(&mut self, module: &ResolvedModule) -> Result<Option<Ty>, Diagnostic> {
+    fn run(&mut self, module: &ResolvedModule) -> Result<(), Diagnostic> {
+        self.apply_imports(module)?;
         self.build_decls(&module.module)?;
         self.seed_globals(module)?;
-        self.check_items(&module.module)?;
-        Ok(self.export_ty.clone())
+        self.check_items(&module.module)
+    }
+
+    fn apply_imports(&mut self, module: &ResolvedModule) -> Result<(), Diagnostic> {
+        for import in &module.imports {
+            for imported in &import.names {
+                self.apply_imported_name(imported)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_imported_name(&mut self, imported: &ImportedName) -> Result<(), Diagnostic> {
+        match &imported.kind {
+            ImportedKind::Value { source } => {
+                let ty = self
+                    .module_tys
+                    .get(&imported.origin)
+                    .and_then(|tys| tys.get(source))
+                    .cloned()
+                    .ok_or_else(|| {
+                        self.error(
+                            format!("`{}` の型が求まっていません", imported.name.text),
+                            imported.name.span,
+                        )
+                    })?;
+                self.define(&imported.name.text, ty);
+            }
+            ImportedKind::Decl {
+                source_decl,
+                source_impl,
+            } => {
+                let info = self
+                    .module_decls
+                    .get(&imported.origin)
+                    .and_then(|decls| decls.get(source_decl))
+                    .cloned()
+                    .ok_or_else(|| {
+                        self.error(
+                            format!("`{}` の宣言が求まっていません", imported.name.text),
+                            imported.name.span,
+                        )
+                    })?;
+                self.decl_kinds.insert(
+                    imported.name.text.clone(),
+                    matches!(info, DeclInfo::Record(_)),
+                );
+                if let (Some(_), DeclInfo::Func(params, ret)) = (source_impl, &info) {
+                    self.define(
+                        &kebab_of(&imported.name.text),
+                        Ty::Fn(params.clone(), Box::new(ret.clone())),
+                    );
+                }
+                self.decls.insert(imported.name.text.clone(), info);
+            }
+        }
+        Ok(())
     }
 
     fn build_decls(&mut self, module: &Module) -> Result<(), Diagnostic> {
@@ -118,19 +183,6 @@ impl<'a> Checker<'a> {
         );
         self.define("true", Ty::Bool);
         self.define("false", Ty::Bool);
-        for import in &module.imports {
-            for name in &import.names {
-                match self.export_tys.get(&import.file) {
-                    Some(ty) => self.define(&name.text, ty.clone()),
-                    None => {
-                        return Err(self.error(
-                            format!("import した `{}` の型が求まっていません", name.text),
-                            name.span,
-                        ));
-                    }
-                }
-            }
-        }
         for item in &module.module.items {
             if let Item::Binding(binding) = item {
                 match &binding.kind {
@@ -138,9 +190,7 @@ impl<'a> Checker<'a> {
                         if let Some(DeclInfo::Func(params, ret)) = self.decls.get(&def.text) {
                             let ty = Ty::Fn(params.clone(), Box::new(ret.clone()));
                             self.define(&name.text, ty.clone());
-                            if binding.is_pub {
-                                self.export_ty = Some(ty);
-                            }
+                            self.top_tys.insert(name.text.clone(), ty);
                         }
                     }
                     BindingKind::Value {
@@ -148,9 +198,7 @@ impl<'a> Checker<'a> {
                     } => {
                         let ty = self.ty_of(te)?;
                         self.define(&name.text, ty.clone());
-                        if binding.is_pub {
-                            self.export_ty = Some(ty);
-                        }
+                        self.top_tys.insert(name.text.clone(), ty);
                     }
                     BindingKind::Value { ty: None, .. } => {}
                 }
@@ -181,7 +229,8 @@ impl<'a> Checker<'a> {
                         value,
                     } => {
                         let ty = self.infer_expr(value)?;
-                        self.define(&name.text, ty);
+                        self.define(&name.text, ty.clone());
+                        self.top_tys.insert(name.text.clone(), ty);
                     }
                 },
                 Item::Expr(expr) => {
@@ -995,12 +1044,38 @@ mod tests {
     use super::*;
     use crate::resolve::resolve_program;
     use crate::source::SourceMap;
+    use std::env;
+    use std::fs;
     use std::path::PathBuf;
 
+    struct TmpDir {
+        path: PathBuf,
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn temp_dir() -> TmpDir {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = env::temp_dir().join(format!("clum-typeck-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&path).unwrap();
+        TmpDir { path }
+    }
+
     fn typeck_of(src: &str) -> (SourceMap, Result<Vec<Diagnostic>, Diagnostic>) {
+        let dir = temp_dir();
+        fs::write(dir.path.join("_.clum"), src).unwrap();
         let mut sources = SourceMap::new();
-        let file = sources.add_file(PathBuf::from("main.clum"), src.to_string());
-        let program = resolve_program(&mut sources, file).expect("resolve に成功する前提です");
+        let program = resolve_program(&mut sources, &dir.path).unwrap_or_else(|diagnostic| {
+            panic!(
+                "resolve に成功する前提です: {}",
+                diagnostic.render(&sources)
+            )
+        });
         let result = check_program(&program);
         (sources, result)
     }
@@ -1079,7 +1154,6 @@ mod tests {
     #[test]
     fn record_construction_and_build_and_bang_ok() {
         let src = concat!(
-            ":pub\n",
             "index: Html = h .html\n",
             "\n",
             "Recipe\n",
@@ -1115,7 +1189,6 @@ mod tests {
             "# Card title: String, body: Html -> Html\n",
             "card: Card title, body -> h .div\n",
             "  {title}\n",
-            ":pub\n",
             "page: Html = h .body\n",
             "  Card 'お知らせ'\n",
             "    h .p\n",
@@ -1130,7 +1203,6 @@ mod tests {
             "# Card title: String, body: Vec<Html> -> Html\n",
             "card: Card title, body -> h .div\n",
             "  {body}\n",
-            ":pub\n",
             "page: Html = h .body\n",
             "  Card 'お知らせ'\n",
             "    h .p\n",
@@ -1149,7 +1221,6 @@ mod tests {
             "# Card title: String, body: Html -> Html\n",
             "card: Card title, body -> h .div\n",
             "  {title}\n",
-            ":pub\n",
             "page: Html = h .body\n",
             "  Card 'お知らせ'\n",
             "    {para}\n",
@@ -1163,7 +1234,6 @@ mod tests {
             "# Card title: String, body: Html -> Html\n",
             "card: Card title, body -> h .div\n",
             "  {title}\n",
-            ":pub\n",
             "page: Html = h .body\n",
             "  Card 'お知らせ'\n",
             "    h .p\n",
@@ -1187,7 +1257,6 @@ mod tests {
             "# Card title: String, body: Html -> Html\n",
             "card: Card title, body -> h .div\n",
             "  {title}\n",
-            ":pub\n",
             "page: Html = h .body\n",
             "  Card 'お知らせ'\n",
             "    {items}\n",
@@ -1313,7 +1382,7 @@ mod tests {
 
     #[test]
     fn unknown_tag_is_error_with_suggestion() {
-        let src = ":pub\nindex: Html = h .dvi\n";
+        let src = "index: Html = h .dvi\n";
         let message = error_of(src);
         assert!(message.contains("`Tag` に `.dvi` はありません"));
         assert!(message.contains("もしかして `.div` ですか？"));
@@ -1321,14 +1390,14 @@ mod tests {
 
     #[test]
     fn unknown_attribute_is_error() {
-        let src = ":pub\nindex: Html = h .div foo 'bar'\n";
+        let src = "index: Html = h .div foo 'bar'\n";
         let message = error_of(src);
         assert!(message.contains("`.div` 要素に属性 `foo` はありません"));
     }
 
     #[test]
     fn on_attribute_is_error() {
-        let src = ":pub\nindex: Html = h .button on-click 'x'\n";
+        let src = "index: Html = h .button on-click 'x'\n";
         let message = error_of(src);
         assert!(message.contains("`on-*` 属性 `on-click` は html ターゲットでは使えません"));
         assert!(message.contains("js ターゲットの責務"));
@@ -1336,22 +1405,22 @@ mod tests {
 
     #[test]
     fn void_element_child_is_error() {
-        let src = ":pub\nindex: Html = h .br\n  child\n";
+        let src = "index: Html = h .br\n  child\n";
         let message = error_of(src);
         assert!(message.contains("void 要素 `.br` は子を持てません"));
-        assert!(message.contains(":3:3"));
+        assert!(message.contains(":2:3"));
     }
 
     #[test]
     fn boolean_attribute_with_value_is_error() {
-        let src = ":pub\nindex: Html = h .input disabled 'x'\n";
+        let src = "index: Html = h .input disabled 'x'\n";
         let message = error_of(src);
         assert!(message.contains("真偽属性 `disabled` に値は指定できません"));
     }
 
     #[test]
     fn value_attribute_without_value_is_error() {
-        let src = ":pub\nindex: Html = h .a href\n";
+        let src = "index: Html = h .a href\n";
         let message = error_of(src);
         assert!(message.contains("属性 `href` には値が必要です"));
     }
@@ -1376,7 +1445,7 @@ mod tests {
 
     #[test]
     fn missing_alt_is_warning() {
-        let src = ":pub\nindex: Html = h .img src '/logo.png'\n";
+        let src = "index: Html = h .img src '/logo.png'\n";
         let message = warning_of(src);
         assert!(message.starts_with("warning:"));
         assert!(message.contains("img 要素に alt 属性がありません"));
@@ -1384,7 +1453,7 @@ mod tests {
 
     #[test]
     fn img_with_alt_has_no_warning() {
-        let src = ":pub\nindex: Html = h .img src '/l.png', alt 'ロゴ'\n";
+        let src = "index: Html = h .img src '/l.png', alt 'ロゴ'\n";
         assert!(expect_ok(src).is_empty());
     }
 

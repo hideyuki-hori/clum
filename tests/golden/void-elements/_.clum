@@ -1,0 +1,10 @@
+index: Html = h .div
+  h .br
+  h .img src '/logo.png', alt 'logo'
+
+Recipe
+  documents:
+    - path: './dist/index.html'
+      element: index
+  |> build
+  |> !

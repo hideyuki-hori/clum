@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::PathBuf;
 
 use crate::diag::Diagnostic;
@@ -7,7 +6,7 @@ use crate::resolve;
 use crate::source::SourceMap;
 use crate::typeck;
 
-const USAGE: &str = "使い方: clum build <path>";
+const USAGE: &str = "使い方: clum build <ディレクトリ>";
 
 pub fn run(args: &[String]) -> u8 {
     match args.first().map(String::as_str) {
@@ -27,26 +26,23 @@ pub fn run(args: &[String]) -> u8 {
 
 fn run_build(path_arg: Option<&String>) -> u8 {
     let Some(path_arg) = path_arg else {
-        eprintln!("error: build コマンドにはビルド対象のファイルパスを指定してください");
+        eprintln!("error: build コマンドにはビルド対象のディレクトリを指定してください");
         eprintln!("{USAGE}");
         return 1;
     };
 
     let path = PathBuf::from(path_arg);
-    let content = match fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(err) => {
-            let display = path.display();
-            let message = format!("ファイル `{display}` を読み込めません: {err}");
-            let diagnostic = Diagnostic::error(message);
-            eprintln!("{}", diagnostic.render(&SourceMap::new()));
-            return 1;
-        }
-    };
+    if path.is_file() {
+        let diagnostic = Diagnostic::error(format!(
+            "`{path_arg}` はファイルです。ファイルパス指定は廃止されました"
+        ))
+        .with_label("`clum build <ディレクトリ>` の形で指定します（そのディレクトリの窓口 `_.clum` が実行されます）");
+        eprintln!("{}", diagnostic.render(&SourceMap::new()));
+        return 1;
+    }
 
     let mut sources = SourceMap::new();
-    let file = sources.add_file(path, content);
-    let program = match resolve::resolve_program(&mut sources, file) {
+    let program = match resolve::resolve_program(&mut sources, &path) {
         Ok(program) => program,
         Err(diagnostic) => {
             eprintln!("{}", diagnostic.render(&sources));
@@ -76,6 +72,7 @@ fn run_build(path_arg: Option<&String>) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn run_with_no_args_fails() {
@@ -93,22 +90,49 @@ mod tests {
     }
 
     #[test]
-    fn run_build_with_unreadable_path_fails() {
+    fn run_build_with_missing_dir_fails() {
         assert_eq!(
-            run(&["build".to_string(), "/does/not/exist.clum".to_string()]),
+            run(&["build".to_string(), "/does/not/exist".to_string()]),
             1
         );
     }
 
     #[test]
-    fn run_build_with_readable_path_succeeds() {
-        let dir = std::env::temp_dir().join(format!("clum-cli-unit-{}", std::process::id()));
+    fn run_build_with_file_path_fails() {
+        let dir = std::env::temp_dir().join(format!("clum-cli-file-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("main.clum");
+        let path = dir.join("_.clum");
         fs::write(&path, "").unwrap();
 
         assert_eq!(
             run(&["build".to_string(), path.to_string_lossy().into_owned()]),
+            1
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_build_without_window_fails() {
+        let dir = std::env::temp_dir().join(format!("clum-cli-nowin-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        assert_eq!(
+            run(&["build".to_string(), dir.to_string_lossy().into_owned()]),
+            1
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_build_with_window_succeeds() {
+        let dir = std::env::temp_dir().join(format!("clum-cli-ok-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("_.clum"), "").unwrap();
+
+        assert_eq!(
+            run(&["build".to_string(), dir.to_string_lossy().into_owned()]),
             0
         );
 

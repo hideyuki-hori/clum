@@ -1,0 +1,11 @@
+name: String = 'A&B'
+
+index: Html = h .p
+  {name} は {{x}} です
+
+Recipe
+  documents:
+    - path: './dist/index.html'
+      element: index
+  |> build
+  |> !

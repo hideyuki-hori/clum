@@ -1,5 +1,0 @@
-error: import 先のファイル `missing.clum` が見つかりません
- --> main.clum:1:2
-  |
-1 | @./missing
-  |  ^^^^^^^^^

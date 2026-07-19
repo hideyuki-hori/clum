@@ -1,6 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use crate::ast::{
@@ -15,6 +14,8 @@ use crate::span::Span;
 const PRELUDE_VALUES: &[&str] = &["map", "build", "true", "false"];
 const PRELUDE_DECLS: &[&str] = &["Recipe", "Document"];
 
+pub const WINDOW_FILE: &str = "_.clum";
+
 #[derive(Debug)]
 pub struct Program {
     pub entry: FileId,
@@ -25,135 +26,691 @@ pub struct Program {
 pub struct ResolvedModule {
     pub file: FileId,
     pub module: Module,
-    pub export: Option<Name>,
+    pub is_window: bool,
+    pub is_entry: bool,
     pub imports: Vec<ModuleImport>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ModuleImport {
-    pub file: FileId,
-    pub names: Vec<Name>,
     pub path_text: String,
     pub span: Span,
+    pub names: Vec<ImportedName>,
 }
 
-pub fn resolve_program(sources: &mut SourceMap, entry: FileId) -> Result<Program, Diagnostic> {
-    let entry_path = sources.get(entry).path().to_path_buf();
-    let entry_canon = fs::canonicalize(&entry_path).unwrap_or(entry_path);
-    let modules = {
-        let mut loader = Loader {
-            sources,
-            by_path: HashMap::new(),
-            on_stack: Vec::new(),
-            modules: Vec::new(),
-        };
-        loader.load(entry, entry_canon)?;
-        loader.modules
+#[derive(Debug, Clone)]
+pub struct ImportedName {
+    pub name: Name,
+    pub origin: FileId,
+    pub kind: ImportedKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum ImportedKind {
+    Value {
+        source: String,
+    },
+    Decl {
+        source_decl: String,
+        source_impl: Option<String>,
+    },
+}
+
+pub fn kebab_of(upper: &str) -> String {
+    let mut out = String::new();
+    for (index, c) in upper.chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if index > 0 {
+                out.push('-');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone)]
+struct NsEntry {
+    origin: FileId,
+    kind: ImportedKind,
+}
+
+pub fn resolve_program(sources: &mut SourceMap, dir: &Path) -> Result<Program, Diagnostic> {
+    let canon = fs::canonicalize(dir).map_err(|err| {
+        Diagnostic::error(format!(
+            "ディレクトリ `{}` を開けません: {err}",
+            dir.display()
+        ))
+    })?;
+    if !canon.is_dir() {
+        return Err(Diagnostic::error(format!(
+            "`{}` はディレクトリではありません",
+            dir.display()
+        ))
+        .with_label(
+            "`clum build <ディレクトリ>` の形で指定します（ファイルパス指定は廃止されました）",
+        ));
+    }
+    let mut loader = Loader {
+        sources,
+        dir_ids: HashMap::new(),
+        dirs: Vec::new(),
+        files: Vec::new(),
+        by_file: HashMap::new(),
+        pending: Vec::new(),
     };
-    check_modules(sources, entry, &modules)?;
+    let entry_dir = loader.ensure_dir(canon, clean_display(dir), None)?;
+    let Some(entry) = loader.dirs[entry_dir].window else {
+        return Err(Diagnostic::error(format!(
+            "`{}` に窓口 `{WINDOW_FILE}` がありません",
+            dir.display()
+        ))
+        .with_label("`clum build <ディレクトリ>` はそのディレクトリの窓口 `_.clum` を実行します"));
+    };
+    while let Some(index) = loader.pending.pop() {
+        loader.resolve_imports(index)?;
+    }
+    for index in 0..loader.files.len() {
+        loader.check_file(index)?;
+    }
+    let ordered = order_files(loader.sources, &loader.files, &loader.by_file)?;
+    let mut entries: Vec<Option<FileEntry>> = loader.files.into_iter().map(Some).collect();
+    let mut modules = Vec::with_capacity(ordered.len());
+    for index in ordered {
+        let entry_data = entries[index].take().expect("順序は一意のはずです");
+        modules.push(ResolvedModule {
+            file: entry_data.file,
+            module: entry_data.module,
+            is_window: entry_data.is_window,
+            is_entry: entry_data.file == entry,
+            imports: entry_data.imports,
+        });
+    }
     Ok(Program { entry, modules })
+}
+
+struct DirData {
+    canon: PathBuf,
+    display: PathBuf,
+    window: Option<FileId>,
+    face: HashMap<String, NsEntry>,
+}
+
+struct FileEntry {
+    file: FileId,
+    dir: usize,
+    is_window: bool,
+    stem: String,
+    module: Module,
+    exports: HashMap<String, ImportedKind>,
+    imports: Vec<ModuleImport>,
 }
 
 struct Loader<'a> {
     sources: &'a mut SourceMap,
-    by_path: HashMap<PathBuf, FileId>,
-    on_stack: Vec<(PathBuf, FileId)>,
-    modules: Vec<ResolvedModule>,
+    dir_ids: HashMap<PathBuf, usize>,
+    dirs: Vec<DirData>,
+    files: Vec<FileEntry>,
+    by_file: HashMap<FileId, usize>,
+    pending: Vec<usize>,
+}
+
+enum SiblingTarget {
+    File(usize),
+    Subdir(usize),
 }
 
 impl Loader<'_> {
-    fn load(&mut self, file: FileId, canon: PathBuf) -> Result<(), Diagnostic> {
-        self.on_stack.push((canon.clone(), file));
-        let content = self.sources.get(file).content().to_string();
-        let module = parse(&content, file)?;
-        let export = find_export(&module);
-        let mut imports = Vec::new();
-        for item in &module.items {
-            if let Item::Import(import) = item {
-                let target = self.resolve_import(file, import)?;
-                imports.push(ModuleImport {
-                    file: target,
-                    names: import.names.clone(),
-                    path_text: import.path.text.clone(),
-                    span: import.span,
-                });
+    fn ensure_dir(
+        &mut self,
+        canon: PathBuf,
+        display: PathBuf,
+        blame: Option<(FileId, Span)>,
+    ) -> Result<usize, Diagnostic> {
+        if let Some(&id) = self.dir_ids.get(&canon) {
+            return Ok(id);
+        }
+        let id = self.dirs.len();
+        self.dir_ids.insert(canon.clone(), id);
+        self.dirs.push(DirData {
+            canon: canon.clone(),
+            display: display.clone(),
+            window: None,
+            face: HashMap::new(),
+        });
+
+        let mut names = Vec::new();
+        let entries = fs::read_dir(&canon).map_err(|err| {
+            io_error(
+                format!("ディレクトリ `{}` を読めません: {err}", display.display()),
+                blame,
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|err| {
+                io_error(
+                    format!("ディレクトリ `{}` を読めません: {err}", display.display()),
+                    blame,
+                )
+            })?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".clum") && entry.path().is_file() {
+                names.push(name);
             }
         }
-        self.on_stack.pop();
-        self.by_path.insert(canon, file);
-        self.modules.push(ResolvedModule {
-            file,
-            module,
-            export,
-            imports,
-        });
+        names.sort();
+
+        let mut file_indexes = Vec::new();
+        for name in names {
+            let path = canon.join(&name);
+            let content = fs::read_to_string(&path).map_err(|err| {
+                io_error(
+                    format!(
+                        "ファイル `{}` を読めません: {err}",
+                        display.join(&name).display()
+                    ),
+                    blame,
+                )
+            })?;
+            let file = self.sources.add_file(display.join(&name), content.clone());
+            let module = parse(&content, file)?;
+            let is_window = name == WINDOW_FILE;
+            if is_window {
+                self.dirs[id].window = Some(file);
+            }
+            let stem = name.trim_end_matches(".clum").to_string();
+            let index = self.files.len();
+            self.by_file.insert(file, index);
+            self.files.push(FileEntry {
+                file,
+                dir: id,
+                is_window,
+                stem,
+                module,
+                exports: HashMap::new(),
+                imports: Vec::new(),
+            });
+            file_indexes.push(index);
+            self.pending.push(index);
+        }
+
+        for &index in &file_indexes {
+            self.collect_file_exports(index)?;
+        }
+        self.build_face(id)?;
+        Ok(id)
+    }
+
+    fn collect_file_exports(&mut self, index: usize) -> Result<(), Diagnostic> {
+        let file = self.files[index].file;
+        let mut exports = HashMap::new();
+        {
+            let module = &self.files[index].module;
+            for item in &module.items {
+                match item {
+                    Item::Binding(binding) if binding.exposed => match &binding.kind {
+                        BindingKind::Impl { name, def, .. } => {
+                            return Err(Diagnostic::error(format!(
+                                "実装 `{}` に `^` は付けません",
+                                name.text
+                            ))
+                            .at(file, name.span)
+                            .with_label(format!(
+                                "`^# {}` と宣言に前置すれば、実装は双方向随伴で付いてきます",
+                                def.text
+                            )));
+                        }
+                        BindingKind::Value { name, ty, .. } => {
+                            if ty.is_none() {
+                                return Err(Diagnostic::error(format!(
+                                    "公開する `{}` には型注釈が必要です",
+                                    name.text
+                                ))
+                                .at(file, name.span)
+                                .with_label(
+                                    "`^` された定義は境界です。`^名前: 型 = 式` の形で束縛してください",
+                                ));
+                            }
+                            exports.insert(
+                                name.text.clone(),
+                                ImportedKind::Value {
+                                    source: name.text.clone(),
+                                },
+                            );
+                        }
+                    },
+                    Item::Decl(decl) if decl.exposed => {
+                        let impl_name = module.items.iter().find_map(|item| match item {
+                            Item::Binding(Binding {
+                                kind:
+                                    BindingKind::Impl {
+                                        name: impl_name,
+                                        def,
+                                        ..
+                                    },
+                                ..
+                            }) if def.text == decl.name.text => Some(impl_name.text.clone()),
+                            _ => None,
+                        });
+                        exports.insert(
+                            decl.name.text.clone(),
+                            ImportedKind::Decl {
+                                source_decl: decl.name.text.clone(),
+                                source_impl: impl_name,
+                            },
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.files[index].exports = exports;
         Ok(())
     }
 
-    fn resolve_import(&mut self, importer: FileId, import: &Import) -> Result<FileId, Diagnostic> {
-        let base = self
-            .sources
-            .get(importer)
-            .path()
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
-        let joined = clean_path(&base.join(format!("{}.clum", import.path.text)));
-        let canon = match fs::canonicalize(&joined) {
-            Ok(canon) => canon,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return Err(Diagnostic::error(format!(
-                    "import 先のファイル `{}` が見つかりません",
-                    joined.display()
-                ))
-                .at(importer, import.path.span));
-            }
-            Err(err) => {
-                return Err(Diagnostic::error(format!(
-                    "import 先のファイル `{}` を読み込めません: {err}",
-                    joined.display()
-                ))
-                .at(importer, import.path.span));
-            }
+    fn build_face(&mut self, dir: usize) -> Result<(), Diagnostic> {
+        let Some(window) = self.dirs[dir].window else {
+            return Ok(());
         };
-        if let Some(pos) = self.on_stack.iter().position(|(path, _)| path == &canon) {
-            let mut chain: Vec<String> = self.on_stack[pos..]
-                .iter()
-                .map(|(_, id)| self.sources.get(*id).path().display().to_string())
-                .collect();
-            chain.push(
-                self.sources
-                    .get(self.on_stack[pos].1)
-                    .path()
-                    .display()
-                    .to_string(),
+        let window_index = self.by_file[&window];
+        let reexports: Vec<Import> = self.files[window_index]
+            .module
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Import(import) if import.reexport => Some(import.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut sources_seen: HashSet<(FileId, String)> = HashSet::new();
+        for import in reexports {
+            let target = self.sibling_target(window, dir, &import, true)?;
+            for entry in &import.names {
+                let ns_entry = match &target {
+                    SiblingTarget::File(file_index) => {
+                        let origin = self.files[*file_index].file;
+                        let Some(kind) = self.files[*file_index].exports.get(&entry.source.text)
+                        else {
+                            return Err(Diagnostic::error(format!(
+                                "`{}` は `{}` の公開名ではありません",
+                                entry.source.text, import.path.text
+                            ))
+                            .at(window, entry.source.span)
+                            .with_label("そのファイルが `^` を前置した定義だけを差し出せます"));
+                        };
+                        NsEntry {
+                            origin,
+                            kind: kind.clone(),
+                        }
+                    }
+                    SiblingTarget::Subdir(sub) => {
+                        let Some(ns_entry) = self.dirs[*sub].face.get(&entry.source.text) else {
+                            return Err(Diagnostic::error(format!(
+                                "`{}` は `{}` の公開名ではありません",
+                                entry.source.text, import.path.text
+                            ))
+                            .at(window, entry.source.span)
+                            .with_label(
+                                "そのサブディレクトリの窓口が `^@` で差し出した名前だけを中継できます",
+                            ));
+                        };
+                        ns_entry.clone()
+                    }
+                };
+                let source_key = match &ns_entry.kind {
+                    ImportedKind::Value { source } => source.clone(),
+                    ImportedKind::Decl { source_decl, .. } => source_decl.clone(),
+                };
+                if !sources_seen.insert((ns_entry.origin, source_key)) {
+                    return Err(Diagnostic::error(format!(
+                        "`{}` はすでに別の名前で差し出されています",
+                        entry.source.text
+                    ))
+                    .at(window, entry.source.span)
+                    .with_label("同じ元を2つの名前では差し出せません（差し出し名は一意です）"));
+                }
+                if self.dirs[dir].face.contains_key(&entry.name.text) {
+                    return Err(Diagnostic::error(format!(
+                        "`{}` を重複して差し出しています",
+                        entry.name.text
+                    ))
+                    .at(window, entry.name.span)
+                    .with_label("同じ名前は一度しか差し出せません"));
+                }
+                self.dirs[dir]
+                    .face
+                    .insert(entry.name.text.clone(), ns_entry);
+            }
+        }
+        Ok(())
+    }
+
+    fn sibling_target(
+        &mut self,
+        file: FileId,
+        dir: usize,
+        import: &Import,
+        reexport: bool,
+    ) -> Result<SiblingTarget, Diagnostic> {
+        let text = import.path.text.as_str();
+        let (symbol, forms) = if reexport {
+            ("^@", "`^@./ファイル名` か `^@./サブディレクトリ`")
+        } else {
+            ("@", "`@./ファイル名` か `@./サブディレクトリ`")
+        };
+        let Some(name) = text.strip_prefix("./") else {
+            return Err(
+                Diagnostic::error(format!("`{symbol}` のパス `{text}` が不正です"))
+                    .at(file, import.path.span)
+                    .with_label(format!("出どころを明示します（{forms}）")),
             );
-            return Err(Diagnostic::error(format!(
-                "循環 import を検出しました: {}",
-                chain.join(" -> ")
-            ))
-            .at(importer, import.path.span));
-        }
-        if let Some(&existing) = self.by_path.get(&canon) {
-            return Ok(existing);
-        }
-        let content = match fs::read_to_string(&canon) {
-            Ok(content) => content,
-            Err(err) => {
-                return Err(Diagnostic::error(format!(
-                    "import 先のファイル `{}` を読み込めません: {err}",
-                    joined.display()
-                ))
-                .at(importer, import.path.span));
-            }
         };
-        let target = self.sources.add_file(joined, content);
-        self.load(target, canon)?;
-        Ok(target)
+        if !reexport
+            && name.contains('/')
+            && name
+                .split('/')
+                .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+        {
+            return Err(
+                Diagnostic::error(format!("複数段の下り import（`{text}`）は未決定です"))
+                    .at(file, import.path.span)
+                    .with_label("コア仕様の要決定31です。1段ずつ import してください"),
+            );
+        }
+        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+            return Err(
+                Diagnostic::error(format!("`{symbol}` のパス `{text}` が不正です"))
+                    .at(file, import.path.span)
+                    .with_label(format!("出どころを明示します（{forms}）")),
+            );
+        }
+        if name == "_" {
+            return Err(Diagnostic::error("窓口 `_.clum` は import で指せません")
+                .at(file, import.path.span)
+                .with_label(
+                    "窓口はディレクトリを代弁するファイルであり、定義の置き場所ではありません",
+                ));
+        }
+        let canon = self.dirs[dir].canon.clone();
+        let display = self.dirs[dir].display.clone();
+        let file_index = self
+            .files
+            .iter()
+            .position(|entry| entry.dir == dir && entry.stem == name && !entry.is_window);
+        let subdir_exists = canon.join(name).is_dir();
+        match (file_index, subdir_exists) {
+            (Some(_), true) => Err(Diagnostic::error(format!(
+                "`{text}` はファイル `{name}.clum` とサブディレクトリ `{name}/` の両方に一致します"
+            ))
+            .at(file, import.path.span)
+            .with_label("どちらかを改名して曖昧さを解消してください")),
+            (Some(index), false) => Ok(SiblingTarget::File(index)),
+            (None, true) => {
+                let sub_canon = fs::canonicalize(canon.join(name)).map_err(|err| {
+                    Diagnostic::error(format!("ディレクトリ `{text}` を開けません: {err}"))
+                        .at(file, import.path.span)
+                })?;
+                let sub = self.ensure_dir(
+                    sub_canon,
+                    display.join(name),
+                    Some((file, import.path.span)),
+                )?;
+                if self.dirs[sub].window.is_none() {
+                    return Err(Diagnostic::error(format!(
+                        "`{text}` は窓口 `{WINDOW_FILE}` を持たないため公開名がありません"
+                    ))
+                    .at(file, import.path.span)
+                    .with_label(
+                        "ディレクトリの外へ差し出す名前は、窓口の `^@` ブロックに列挙します",
+                    ));
+                }
+                Ok(SiblingTarget::Subdir(sub))
+            }
+            (None, false) => Err(Diagnostic::error(format!(
+                "`{text}` に一致するファイル・サブディレクトリが見つかりません"
+            ))
+            .at(file, import.path.span)),
+        }
+    }
+
+    fn resolve_imports(&mut self, index: usize) -> Result<(), Diagnostic> {
+        let file = self.files[index].file;
+        let dir = self.files[index].dir;
+        let is_window = self.files[index].is_window;
+        let imports: Vec<Import> = self.files[index]
+            .module
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Import(import) => Some(import.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut resolved = Vec::new();
+        for import in imports {
+            if import.reexport && !is_window {
+                return Err(Diagnostic::error("`^@` を書けるのは窓口 `_.clum` だけです")
+                    .at(file, import.span)
+                    .with_label(
+                        "親へ差し出すのは窓口の仕事です。ファイルの定義は `^` の前置で公開します",
+                    ));
+            }
+            if import.path.text == "." {
+                return Err(Diagnostic::error("`@.` は廃止されました")
+                    .at(file, import.path.span)
+                    .with_label(
+                        "兄弟ファイルは `@./ファイル名` で、出どころを明示して import します",
+                    ));
+            }
+            let names = if import.path.text.starts_with("./") {
+                let target = self.sibling_target(file, dir, &import, import.reexport)?;
+                match target {
+                    SiblingTarget::File(file_index) => {
+                        self.bind_file_names(file, file_index, &import)?
+                    }
+                    SiblingTarget::Subdir(sub) => self.bind_face_names(file, sub, &import)?,
+                }
+            } else {
+                let target = parse_import_path(&import.path.text).map_err(|(message, label)| {
+                    Diagnostic::error(message)
+                        .at(file, import.path.span)
+                        .with_label(label)
+                })?;
+                let ImportTarget::Walk { ups, down } = target;
+                let target_dir = self.walk_to_dir(file, dir, &import, ups, down.as_deref())?;
+                self.bind_face_names(file, target_dir, &import)?
+            };
+            resolved.push(ModuleImport {
+                path_text: import.path.text.clone(),
+                span: import.span,
+                names,
+            });
+        }
+        self.files[index].imports = resolved;
+        Ok(())
+    }
+
+    fn walk_to_dir(
+        &mut self,
+        file: FileId,
+        dir: usize,
+        import: &Import,
+        ups: usize,
+        down: Option<&str>,
+    ) -> Result<usize, Diagnostic> {
+        let mut canon = self.dirs[dir].canon.clone();
+        let mut display = self.dirs[dir].display.clone();
+        for _ in 0..ups {
+            let Some(parent) = canon.parent() else {
+                return Err(Diagnostic::error("これ以上、上のディレクトリはありません")
+                    .at(file, import.path.span));
+            };
+            canon = parent.to_path_buf();
+            display = display_parent(&display);
+        }
+        if let Some(down) = down {
+            let target = canon.join(down);
+            if !target.is_dir() {
+                if canon.join(format!("{down}.clum")).is_file() {
+                    return Err(Diagnostic::error(
+                        "フォルダの外のファイルは import できません",
+                    )
+                    .at(file, import.path.span)
+                    .with_label(
+                        "ファイルの住所は同じフォルダの中でだけ通用します。よそのディレクトリからは窓口の公開名を import します",
+                    ));
+                }
+                return Err(Diagnostic::error(format!(
+                    "ディレクトリ `{}` が見つかりません",
+                    import.path.text
+                ))
+                .at(file, import.path.span));
+            }
+            canon = target;
+            display = display.join(down);
+        }
+        let canon = fs::canonicalize(&canon).map_err(|err| {
+            Diagnostic::error(format!(
+                "ディレクトリ `{}` を開けません: {err}",
+                import.path.text
+            ))
+            .at(file, import.path.span)
+        })?;
+        let id = self.ensure_dir(canon, display, Some((file, import.path.span)))?;
+        if self.dirs[id].window.is_none() {
+            return Err(Diagnostic::error(format!(
+                "`{}` は窓口 `{WINDOW_FILE}` を持たないため import できません",
+                import.path.text
+            ))
+            .at(file, import.path.span)
+            .with_label("ディレクトリの外へ差し出す名前は、窓口の `^@` ブロックに列挙します"));
+        }
+        Ok(id)
+    }
+
+    fn bind_file_names(
+        &self,
+        file: FileId,
+        target_index: usize,
+        import: &Import,
+    ) -> Result<Vec<ImportedName>, Diagnostic> {
+        let origin = self.files[target_index].file;
+        let mut names = Vec::new();
+        for entry in &import.names {
+            let Some(kind) = self.files[target_index].exports.get(&entry.source.text) else {
+                return Err(Diagnostic::error(format!(
+                    "`{}` は `{}` の公開名ではありません",
+                    entry.source.text, import.path.text
+                ))
+                .at(file, entry.source.span)
+                .with_label("そのファイルが `^` を前置した定義だけを import できます"));
+            };
+            names.push(ImportedName {
+                name: entry.name.clone(),
+                origin,
+                kind: kind.clone(),
+            });
+        }
+        Ok(names)
+    }
+
+    fn bind_face_names(
+        &self,
+        file: FileId,
+        dir: usize,
+        import: &Import,
+    ) -> Result<Vec<ImportedName>, Diagnostic> {
+        let mut names = Vec::new();
+        for entry in &import.names {
+            let Some(ns_entry) = self.dirs[dir].face.get(&entry.source.text) else {
+                return Err(Diagnostic::error(format!(
+                    "`{}` は `{}` の公開名ではありません",
+                    entry.source.text, import.path.text
+                ))
+                .at(file, entry.source.span)
+                .with_label(
+                    "import できるのは、そのディレクトリの窓口が `^@` で差し出した名前だけです",
+                ));
+            };
+            names.push(ImportedName {
+                name: entry.name.clone(),
+                origin: ns_entry.origin,
+                kind: ns_entry.kind.clone(),
+            });
+        }
+        Ok(names)
+    }
+
+    fn check_file(&mut self, index: usize) -> Result<(), Diagnostic> {
+        let entry = &self.files[index];
+        if !entry.is_window {
+            check_no_top_level_exprs(entry.file, &entry.module)?;
+        }
+        let mut checker = Checker::new(self.sources, entry.file);
+        checker.check(&entry.module, &entry.imports)
     }
 }
 
-fn clean_path(path: &Path) -> PathBuf {
+fn io_error(message: String, blame: Option<(FileId, Span)>) -> Diagnostic {
+    let diagnostic = Diagnostic::error(message);
+    match blame {
+        Some((file, span)) => diagnostic.at(file, span),
+        None => diagnostic,
+    }
+}
+
+enum ImportTarget {
+    Walk { ups: usize, down: Option<String> },
+}
+
+fn parse_import_path(text: &str) -> Result<ImportTarget, (String, String)> {
+    let segments: Vec<&str> = text.split('/').collect();
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return Err((
+            format!("import パス `{text}` の形が不正です"),
+            "`@./名前`・`@..`（連続可）・`@../名前` の形で書きます".to_string(),
+        ));
+    }
+    let (ups, rest) = match segments[0] {
+        ".." => {
+            let count = segments.iter().take_while(|s| **s == "..").count();
+            (count, &segments[count..])
+        }
+        _ => {
+            return Err((
+                format!("import パス `{text}` は `.` か `..` で始まる必要があります"),
+                "import の対象は相対パスで指す兄弟ファイルかディレクトリだけです".to_string(),
+            ));
+        }
+    };
+    if rest.iter().any(|s| *s == "." || *s == "..") {
+        return Err((
+            format!("import パス `{text}` の形が不正です"),
+            "上り（`..`）はパスの先頭にまとめて書きます".to_string(),
+        ));
+    }
+    if rest.iter().any(|s| s.ends_with(".clum")) {
+        return Err((
+            "フォルダの外のファイルは import できません".to_string(),
+            "ファイルの住所は同じフォルダの中でだけ通用します。よそのディレクトリからは窓口の公開名を import します".to_string(),
+        ));
+    }
+    match rest.len() {
+        0 => Ok(ImportTarget::Walk { ups, down: None }),
+        1 => Ok(ImportTarget::Walk {
+            ups,
+            down: Some(rest[0].to_string()),
+        }),
+        _ => Err((
+            format!("複数段の下り import（`{text}`）は未決定です"),
+            "コア仕様の要決定31です。1段ずつ import してください".to_string(),
+        )),
+    }
+}
+
+fn clean_display(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
@@ -167,11 +724,100 @@ fn clean_path(path: &Path) -> PathBuf {
     out
 }
 
-fn find_export(module: &Module) -> Option<Name> {
-    module.items.iter().find_map(|item| match item {
-        Item::Binding(binding) if binding.is_pub => Some(binding_name(binding).clone()),
-        _ => None,
-    })
+fn display_parent(display: &Path) -> PathBuf {
+    match display.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => display.join(".."),
+    }
+}
+
+fn order_files(
+    sources: &SourceMap,
+    files: &[FileEntry],
+    by_file: &HashMap<FileId, usize>,
+) -> Result<Vec<usize>, Diagnostic> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum State {
+        Unvisited,
+        OnStack,
+        Done,
+    }
+    fn visit(
+        index: usize,
+        sources: &SourceMap,
+        files: &[FileEntry],
+        by_file: &HashMap<FileId, usize>,
+        states: &mut Vec<State>,
+        stack: &mut Vec<usize>,
+        ordered: &mut Vec<usize>,
+    ) -> Result<(), Diagnostic> {
+        states[index] = State::OnStack;
+        stack.push(index);
+        for import in &files[index].imports {
+            for imported in &import.names {
+                let target = by_file[&imported.origin];
+                match states[target] {
+                    State::Done => {}
+                    State::Unvisited => {
+                        visit(target, sources, files, by_file, states, stack, ordered)?;
+                    }
+                    State::OnStack => {
+                        let position = stack
+                            .iter()
+                            .position(|&i| i == target)
+                            .expect("スタック上にあるはずです");
+                        let mut chain: Vec<String> = stack[position..]
+                            .iter()
+                            .map(|&i| sources.get(files[i].file).path().display().to_string())
+                            .collect();
+                        chain.push(sources.get(files[target].file).path().display().to_string());
+                        return Err(Diagnostic::error(format!(
+                            "循環 import を検出しました: {}",
+                            chain.join(" -> ")
+                        ))
+                        .at(files[index].file, imported.name.span));
+                    }
+                }
+            }
+        }
+        stack.pop();
+        states[index] = State::Done;
+        ordered.push(index);
+        Ok(())
+    }
+
+    let mut states = vec![State::Unvisited; files.len()];
+    let mut ordered = Vec::with_capacity(files.len());
+    let mut stack = Vec::new();
+    for index in 0..files.len() {
+        if states[index] == State::Unvisited {
+            visit(
+                index,
+                sources,
+                files,
+                by_file,
+                &mut states,
+                &mut stack,
+                &mut ordered,
+            )?;
+        }
+    }
+    Ok(ordered)
+}
+
+fn check_no_top_level_exprs(file: FileId, module: &Module) -> Result<(), Diagnostic> {
+    for item in &module.items {
+        if let Item::Expr(expr) = item {
+            return Err(Diagnostic::error(
+                "窓口以外のファイルのトップレベルに式は書けません",
+            )
+            .at(file, expr.span())
+            .with_label(
+                "トップレベルの式列を持てるのは窓口 `_.clum` だけです。値が必要なら `名前 = 式` で束縛してください",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn binding_name(binding: &Binding) -> &Name {
@@ -179,40 +825,6 @@ fn binding_name(binding: &Binding) -> &Name {
         BindingKind::Value { name, .. } => name,
         BindingKind::Impl { name, .. } => name,
     }
-}
-
-fn check_modules(
-    sources: &SourceMap,
-    entry: FileId,
-    modules: &[ResolvedModule],
-) -> Result<(), Diagnostic> {
-    let export_of: HashMap<FileId, Option<Name>> = modules
-        .iter()
-        .map(|module| (module.file, module.export.clone()))
-        .collect();
-    for module in modules {
-        if module.file != entry {
-            check_no_top_level_exprs(module)?;
-        }
-        let mut checker = Checker::new(sources, module.file);
-        checker.check(module, &export_of)?;
-    }
-    Ok(())
-}
-
-fn check_no_top_level_exprs(module: &ResolvedModule) -> Result<(), Diagnostic> {
-    for item in &module.module.items {
-        if let Item::Expr(expr) = item {
-            return Err(Diagnostic::error(
-                "エントリポイント以外のファイルのトップレベルに式は書けません",
-            )
-            .at(module.file, expr.span())
-            .with_label(
-                "トップレベルの式を実行できるのはエントリポイントだけです。値が必要なら `名前 = 式` で束縛してください",
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,7 +856,6 @@ struct Checker<'a> {
     frames: Vec<HashMap<String, Binder>>,
     boundary: usize,
     def_impls: Vec<HashMap<String, Span>>,
-    pub_seen: Option<Span>,
 }
 
 impl<'a> Checker<'a> {
@@ -271,18 +882,13 @@ impl<'a> Checker<'a> {
             frames: vec![prelude],
             boundary: 0,
             def_impls: vec![HashMap::new()],
-            pub_seen: None,
         }
     }
 
-    fn check(
-        &mut self,
-        module: &ResolvedModule,
-        export_of: &HashMap<FileId, Option<Name>>,
-    ) -> Result<(), Diagnostic> {
-        self.collect_decls(&module.module)?;
-        self.collect_top_level(module, export_of)?;
-        self.resolve_bodies(&module.module)
+    fn check(&mut self, module: &Module, imports: &[ModuleImport]) -> Result<(), Diagnostic> {
+        self.collect_decls(module)?;
+        self.collect_top_level(module, imports)?;
+        self.resolve_bodies(module)
     }
 
     fn collect_decls(&mut self, module: &Module) -> Result<(), Diagnostic> {
@@ -310,52 +916,30 @@ impl<'a> Checker<'a> {
 
     fn collect_top_level(
         &mut self,
-        module: &ResolvedModule,
-        export_of: &HashMap<FileId, Option<Name>>,
+        module: &Module,
+        imports: &[ModuleImport],
     ) -> Result<(), Diagnostic> {
         self.frames.push(HashMap::new());
-        for import in &module.imports {
-            let export = export_of.get(&import.file).cloned().flatten();
-            for name in &import.names {
-                match &export {
-                    None => {
-                        return Err(Diagnostic::error(format!(
-                            "`{}` は何も export していません",
-                            import.path_text
-                        ))
-                        .at(self.file, name.span)
-                        .with_label("import できるのは相手ファイルの `:pub` 定義だけです"));
+        for import in imports {
+            for imported in &import.names {
+                match &imported.kind {
+                    ImportedKind::Value { .. } => {
+                        self.declare(&imported.name, Origin::Import)?;
                     }
-                    Some(export) if export.text != name.text => {
-                        return Err(Diagnostic::error(format!(
-                            "`{}` は `{}` の export ではありません",
-                            name.text, import.path_text
-                        ))
-                        .at(self.file, name.span)
-                        .with_label(format!(
-                            "`{}` の export は `{}` です",
-                            import.path_text, export.text
-                        )));
+                    ImportedKind::Decl { source_impl, .. } => {
+                        self.declare_imported_decl(&imported.name)?;
+                        if source_impl.is_some() {
+                            let synthesized =
+                                Name::new(kebab_of(&imported.name.text), imported.name.span);
+                            self.declare(&synthesized, Origin::Import)?;
+                        }
                     }
-                    Some(_) => {}
                 }
-                self.declare(name, Origin::Import)?;
             }
         }
         self.frames.push(HashMap::new());
-        for item in &module.module.items {
+        for item in &module.items {
             if let Item::Binding(binding) = item {
-                if binding.is_pub {
-                    if let Some(first) = self.pub_seen {
-                        return Err(Diagnostic::error("`:pub` は1ファイルに1つまでです")
-                            .at(self.file, binding_name(binding).span)
-                            .with_label(format!(
-                                "最初の公開定義は{}行目です",
-                                self.line_of(first)
-                            )));
-                    }
-                    self.pub_seen = Some(binding_name(binding).span);
-                }
                 let name = binding_name(binding);
                 self.declare(name, Origin::TopLevel)?;
                 if let BindingKind::Impl { def, .. } = &binding.kind {
@@ -364,6 +948,24 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn declare_imported_decl(&mut self, name: &Name) -> Result<(), Diagnostic> {
+        if let Some(existing) = self.decls.get(&name.text) {
+            let message = match existing {
+                None => format!("型 `{}` は prelude で定義済みです", name.text),
+                Some(span) => format!(
+                    "import した `{}` は{}行目の宣言と重複しています",
+                    name.text,
+                    self.line_of(*span)
+                ),
+            };
+            return Err(Diagnostic::error(message)
+                .at(self.file, name.span)
+                .with_label("同じ名前の定義を2つ持つことはできません"));
+        }
+        self.decls.insert(name.text.clone(), Some(name.span));
         Ok(())
     }
 
@@ -532,7 +1134,7 @@ impl<'a> Checker<'a> {
         Ok(())
     }
 
-    fn resolve_var(&self, name: &Name) -> Result<(), Diagnostic> {
+    fn resolve_var(&mut self, name: &Name) -> Result<(), Diagnostic> {
         for frame in self.frames.iter().rev() {
             if let Some(binder) = frame.get(&name.text) {
                 if binder.origin == Origin::Local && binder.boundary != self.boundary {
@@ -554,7 +1156,7 @@ impl<'a> Checker<'a> {
         )
     }
 
-    fn resolve_decl_ref(&self, name: &Name, kind: DeclKind) -> Result<(), Diagnostic> {
+    fn resolve_decl_ref(&mut self, name: &Name, kind: DeclKind) -> Result<(), Diagnostic> {
         if self.decls.contains_key(&name.text) {
             return Ok(());
         }
@@ -666,34 +1268,6 @@ mod tests {
     use super::*;
     use std::env;
 
-    fn resolve_single(src: &str) -> Result<(), Diagnostic> {
-        let mut sources = SourceMap::new();
-        let file = sources.add_file(PathBuf::from("main.clum"), src.to_string());
-        let module = parse(src, file).expect("パースに成功する前提です");
-        let export = find_export(&module);
-        let resolved = ResolvedModule {
-            file,
-            module,
-            export,
-            imports: Vec::new(),
-        };
-        let export_of: HashMap<FileId, Option<Name>> =
-            [(file, resolved.export.clone())].into_iter().collect();
-        let mut checker = Checker::new(&sources, file);
-        checker.check(&resolved, &export_of)
-    }
-
-    fn render(src: &str, diagnostic: &Diagnostic) -> String {
-        let mut sources = SourceMap::new();
-        sources.add_file(PathBuf::from("main.clum"), src.to_string());
-        diagnostic.render(&sources)
-    }
-
-    fn error_of(src: &str) -> String {
-        let err = resolve_single(src).expect_err("エラーを期待しました");
-        render(src, &err)
-    }
-
     struct TmpDir {
         path: PathBuf,
     }
@@ -705,47 +1279,50 @@ mod tests {
     }
 
     fn temp_dir(tag: &str) -> TmpDir {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path =
-            env::temp_dir().join(format!("clum-resolve-{tag}-{}-{nanos}", std::process::id()));
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = env::temp_dir().join(format!(
+            "clum-resolve-{tag}-{}-{unique}",
+            std::process::id()
+        ));
         fs::create_dir_all(&path).unwrap();
         TmpDir { path }
     }
 
-    fn resolve_files(dir: &Path, files: &[(&str, &str)]) -> Result<(), String> {
+    fn resolve_files(dir: &Path, files: &[(&str, &str)]) -> Result<Program, String> {
         for (name, content) in files {
-            fs::write(dir.join(name), content).unwrap();
+            let path = dir.join(name);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, content).unwrap();
         }
         let mut sources = SourceMap::new();
-        let entry_path = dir.join("main.clum");
-        let content = fs::read_to_string(&entry_path).unwrap();
-        let entry = sources.add_file(entry_path, content);
-        match resolve_program(&mut sources, entry) {
-            Ok(_) => Ok(()),
+        match resolve_program(&mut sources, dir) {
+            Ok(program) => Ok(program),
             Err(diagnostic) => Err(diagnostic.render(&sources)),
         }
     }
 
-    #[test]
-    fn top_level_reference_resolves() {
-        assert!(resolve_single("title = 'home'\nx = title\n").is_ok());
+    fn resolve_window(src: &str) -> Result<Program, String> {
+        let dir = temp_dir("single");
+        resolve_files(&dir.path, &[("_.clum", src)])
+    }
+
+    fn error_of(src: &str) -> String {
+        resolve_window(src).expect_err("エラーを期待しました")
     }
 
     #[test]
-    fn lambda_reads_top_level_and_own_param() {
-        let src = concat!(
-            "pages =\n",
-            "  - path: './a'\n",
-            "    title: 'A'\n",
-            "items = pages\n",
-            "  |> map page ->\n",
-            "    h .li\n",
-            "      {page.title}\n",
-        );
-        assert!(resolve_single(src).is_ok());
+    fn kebab_of_derives_lower_kebab() {
+        assert_eq!(kebab_of("Card"), "card");
+        assert_eq!(kebab_of("MyButton"), "my-button");
+        assert_eq!(kebab_of("A"), "a");
+    }
+
+    #[test]
+    fn top_level_reference_resolves() {
+        assert!(resolve_window("title = 'home'\nx = title\n").is_ok());
     }
 
     #[test]
@@ -754,49 +1331,24 @@ mod tests {
             "# Card title: String, body: Html -> Html\n",
             "card: Card title, body -> h .div\n",
             "  {title}\n",
-            ":pub\n",
             "page: Html = h .body\n",
             "  Card 'お知らせ'\n",
             "    h .p\n",
             "      本文\n",
         );
-        assert!(resolve_single(src).is_ok());
+        assert!(resolve_window(src).is_ok());
     }
 
     #[test]
     fn undefined_name_is_error() {
         let message = error_of("x = foo\n");
         assert!(message.contains("名前 `foo` は定義されていません"));
-        assert!(message.contains(":1:5"));
     }
 
     #[test]
     fn shadowing_prelude_is_error() {
         let message = error_of("map = 1\n");
         assert!(message.contains("prelude で定義済みの名前"));
-        assert!(message.contains("シャドーイング"));
-    }
-
-    #[test]
-    fn local_shadowing_top_level_is_error() {
-        let src = concat!(
-            "title = 'home'\n",
-            "# Make x: String -> Html\n",
-            "make: Make x ->\n",
-            "  title = x\n",
-            "  h .div\n",
-            "    {title}\n",
-        );
-        let message = error_of(src);
-        assert!(message.contains("トップレベル（1行目）で束縛済みの名前"));
-        assert!(message.contains(":4:3"));
-    }
-
-    #[test]
-    fn reassign_in_same_scope_is_error() {
-        let message = error_of("x = 1\nx = 2\n");
-        assert!(message.contains("`x` はすでに1行目で束縛されています"));
-        assert!(message.contains(":2:1"));
     }
 
     #[test]
@@ -811,177 +1363,348 @@ mod tests {
         );
         let message = error_of(src);
         assert!(message.contains("外側の関数のローカル値です（2行目で束縛）"));
-        assert!(message.contains(":6:10"));
     }
 
     #[test]
-    fn duplicate_impl_of_one_definition_is_error() {
-        let src = concat!(
-            "# Greet name: String -> String\n",
-            "hi: Greet name -> name\n",
-            "yo: Greet name -> name\n",
-        );
-        let message = error_of(src);
-        assert!(message.contains("定義 `Greet` の実装が複数あります"));
-        assert!(message.contains("最初の実装は2行目です"));
-        assert!(message.contains(":3:5"));
-    }
-
-    #[test]
-    fn block_impl_duplicating_top_level_impl_is_error() {
-        let src = concat!(
-            "# Greet name: String -> String\n",
-            "hi: Greet name -> name\n",
-            "xs =\n",
-            "  - 1\n",
-            "items = xs\n",
-            "  |> map n ->\n",
-            "    yo: Greet name -> name\n",
-            "    h .li\n",
-        );
-        let message = error_of(src);
-        assert!(message.contains("定義 `Greet` の実装が複数あります"));
-        assert!(message.contains("最初の実装は2行目です"));
-        assert!(message.contains(":7:9"));
-    }
-
-    #[test]
-    fn duplicate_block_impls_in_same_block_is_error() {
-        let src = concat!(
-            "# Greet name: String -> String\n",
-            "xs =\n",
-            "  - 1\n",
-            "items = xs\n",
-            "  |> map n ->\n",
-            "    hi: Greet name -> name\n",
-            "    yo: Greet name -> name\n",
-            "    h .li\n",
-        );
-        let message = error_of(src);
-        assert!(message.contains("定義 `Greet` の実装が複数あります"));
-        assert!(message.contains("最初の実装は6行目です"));
-        assert!(message.contains(":7:9"));
-    }
-
-    #[test]
-    fn sibling_block_impls_of_same_definition_resolve() {
-        let src = concat!(
-            "# Greet name: String -> String\n",
-            "xs =\n",
-            "  - 1\n",
-            "a = xs\n",
-            "  |> map n ->\n",
-            "    hi: Greet name -> name\n",
-            "    h .li\n",
-            "b = xs\n",
-            "  |> map n ->\n",
-            "    yo: Greet name -> name\n",
-            "    h .li\n",
-        );
-        assert!(resolve_single(src).is_ok());
-    }
-
-    #[test]
-    fn multiple_pub_is_error() {
-        let src = concat!(
-            ":pub\n",
-            "a: Html = h .div\n",
-            ":pub\n",
-            "b: Html = h .span\n",
-        );
-        let message = error_of(src);
-        assert!(message.contains("`:pub` は1ファイルに1つまでです"));
-        assert!(message.contains("最初の公開定義は2行目です"));
-        assert!(message.contains(":4:1"));
-    }
-
-    #[test]
-    fn unknown_component_is_error() {
-        let src = concat!(":pub\n", "page: Html = h .body\n", "  Card 'x'\n",);
-        let message = error_of(src);
-        assert!(message.contains("コンポーネント `Card` は定義されていません"));
-    }
-
-    #[test]
-    fn unknown_record_type_is_error() {
-        let message = error_of("x = Foo\n  a: 1\n");
-        assert!(message.contains("型 `Foo` は定義されていません"));
-    }
-
-    #[test]
-    fn duplicate_decl_is_error() {
-        let message = error_of("# Foo a: i32\n# Foo b: i32\n");
-        assert!(message.contains("型 `Foo` はすでに1行目で宣言されています"));
-    }
-
-    #[test]
-    fn import_resolves_ok() {
-        let dir = temp_dir("import-ok");
+    fn sibling_file_import_resolves() {
+        let dir = temp_dir("sibling-file");
         let result = resolve_files(
             &dir.path,
             &[
-                (
-                    "main.clum",
-                    "@./index\n  index\n\nRecipe\n  documents:\n    - path: './dist/index.html'\n      element: index\n  |> build\n  |> !\n",
-                ),
-                ("index.clum", ":pub\nindex: Html = h .div\n"),
+                ("_.clum", "@./index\n  index\n\nx = index\n"),
+                ("index.clum", "^index: Html = h .div\n"),
             ],
         );
         assert!(result.is_ok(), "{:?}", result.err());
     }
 
     #[test]
-    fn non_entry_top_level_expr_is_error() {
-        let dir = temp_dir("non-entry-top-expr");
+    fn sibling_component_pair_is_importable() {
+        let dir = temp_dir("sibling-pair");
+        let result = resolve_files(
+            &dir.path,
+            &[
+                (
+                    "_.clum",
+                    "@./card\n  Card\n\npage: Html = h .body\n  Card 'x'\n    h .p\n      本文\nused = card\n",
+                ),
+                (
+                    "card.clum",
+                    "^# Card title: String, body: Html -> Html\ncard: Card title, body -> h .div\n  {title}\n",
+                ),
+            ],
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn sibling_without_import_is_error() {
+        let dir = temp_dir("sibling-implicit");
         let message = resolve_files(
             &dir.path,
             &[
-                ("main.clum", "@./index\n  index\n\nx = index\n"),
+                ("_.clum", "x = index\n"),
+                ("index.clum", "^index: Html = h .div\n"),
+            ],
+        )
+        .expect_err("エラーを期待しました");
+        assert!(message.contains("名前 `index` は定義されていません"));
+    }
+
+    #[test]
+    fn unexposed_sibling_name_is_error() {
+        let dir = temp_dir("sibling-private");
+        let message = resolve_files(
+            &dir.path,
+            &[
+                ("_.clum", "@./util\n  helper\n\nx = helper\n"),
+                ("util.clum", "helper: i32 = 1\n"),
+            ],
+        )
+        .expect_err("エラーを期待しました");
+        assert!(message.contains("`helper` は `./util` の公開名ではありません"));
+    }
+
+    #[test]
+    fn same_caret_name_in_two_files_is_allowed() {
+        let dir = temp_dir("same-name");
+        let result = resolve_files(
+            &dir.path,
+            &[
                 (
-                    "index.clum",
-                    ":pub\nindex: Html = h .div\n\nRecipe\n  documents:\n    - path: './x.html'\n      element: index\n  |> build\n  |> !\n",
+                    "_.clum",
+                    "@./a\n  index\n\n@./b\n  b-index = index\n\nx = index\ny = b-index\n",
+                ),
+                ("a.clum", "^index: Html = h .div\n"),
+                ("b.clum", "^index: Html = h .span\n"),
+            ],
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn exposed_value_without_annotation_is_error() {
+        let message = error_of("^index = h .div\n");
+        assert!(message.contains("公開する `index` には型注釈が必要です"));
+    }
+
+    #[test]
+    fn exposed_impl_is_error() {
+        let message = error_of("# Card title: String -> Html\n^card: Card title -> h .div\n");
+        assert!(message.contains("実装 `card` に `^` は付けません"));
+        assert!(message.contains("^# Card"));
+    }
+
+    #[test]
+    fn at_dot_is_abolished_error() {
+        let message = error_of("@.\n  index\n\nx = 1\n");
+        assert!(message.contains("`@.` は廃止されました"));
+        assert!(message.contains("@./ファイル名"));
+    }
+
+    #[test]
+    fn caret_at_dot_is_error() {
+        let message = error_of("^@.\n  index\n");
+        assert!(message.contains("`^@` のパス `.` が不正です"));
+        assert!(message.contains("出どころを明示します"));
+    }
+
+    #[test]
+    fn reexport_outside_window_is_error() {
+        let dir = temp_dir("reexport-outside");
+        let message = resolve_files(
+            &dir.path,
+            &[
+                ("_.clum", "x = 1\n"),
+                ("page.clum", "^@./lib\n  x\n\n^index: Html = h .div\n"),
+            ],
+        )
+        .expect_err("エラーを期待しました");
+        assert!(message.contains("`^@` を書けるのは窓口 `_.clum` だけです"));
+    }
+
+    #[test]
+    fn window_reexports_sibling_file() {
+        let dir = temp_dir("face-file");
+        let result = resolve_files(
+            &dir.path,
+            &[
+                ("_.clum", "@./lib\n  page\n\nx = page\n"),
+                ("lib/_.clum", "^@./page\n  page\n"),
+                ("lib/page.clum", "^page: Html = h .div\n"),
+            ],
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn face_alias_renames_public_name() {
+        let dir = temp_dir("face-alias");
+        let result = resolve_files(
+            &dir.path,
+            &[
+                (
+                    "_.clum",
+                    "@./ui\n  Kado\n\npage: Html = h .body\n  Kado 'x'\n    h .p\n      本文\nused = kado\n",
+                ),
+                ("ui/_.clum", "^@./card\n  Kado = Card\n"),
+                (
+                    "ui/card.clum",
+                    "^# Card title: String, body: Html -> Html\ncard: Card title, body -> h .div\n  {title}\n",
+                ),
+            ],
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn import_alias_renames_local_name() {
+        let dir = temp_dir("import-alias");
+        let result = resolve_files(
+            &dir.path,
+            &[
+                ("_.clum", "@./page\n  front = index\n\nx = front\n"),
+                ("page.clum", "^index: Html = h .div\n"),
+            ],
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn subdir_relay_resolves() {
+        let dir = temp_dir("relay");
+        let result = resolve_files(
+            &dir.path,
+            &[
+                (
+                    "_.clum",
+                    "@./ui\n  Card\n\npage: Html = h .body\n  Card 'x'\n    h .p\n      本文\n",
+                ),
+                ("ui/_.clum", "^@./parts\n  Card\n"),
+                ("ui/parts/_.clum", "^@./card\n  Card\n"),
+                (
+                    "ui/parts/card.clum",
+                    "^# Card title: String, body: Html -> Html\ncard: Card title, body -> h .div\n  {title}\n",
+                ),
+            ],
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn face_unknown_source_is_error() {
+        let dir = temp_dir("face-unknown");
+        let message = resolve_files(
+            &dir.path,
+            &[
+                ("_.clum", "^@./page\n  missing\n"),
+                ("page.clum", "^index: Html = h .div\n"),
+            ],
+        )
+        .expect_err("エラーを期待しました");
+        assert!(message.contains("`missing` は `./page` の公開名ではありません"));
+    }
+
+    #[test]
+    fn face_duplicate_public_name_is_error() {
+        let dir = temp_dir("face-dup");
+        let message = resolve_files(
+            &dir.path,
+            &[
+                ("_.clum", "^@./pages\n  index\n  index = about\n"),
+                (
+                    "pages.clum",
+                    "^index: Html = h .div\n^about: Html = h .span\n",
                 ),
             ],
         )
         .expect_err("エラーを期待しました");
-        assert!(message.contains("エントリポイント以外のファイルのトップレベルに式は書けません"));
-        assert!(message.contains("index.clum:4:1"));
+        assert!(message.contains("`index` を重複して差し出しています"));
     }
 
     #[test]
-    fn import_of_non_export_is_error() {
-        let dir = temp_dir("import-notexport");
+    fn face_duplicate_source_is_error() {
+        let dir = temp_dir("face-dup-source");
         let message = resolve_files(
             &dir.path,
             &[
-                ("main.clum", "@./index\n  wrong\n\nx = wrong\n"),
-                ("index.clum", ":pub\nindex: Html = h .div\n"),
+                ("_.clum", "^@./pages\n  index\n  home = index\n"),
+                ("pages.clum", "^index: Html = h .div\n"),
             ],
         )
         .expect_err("エラーを期待しました");
-        assert!(message.contains("`wrong` は `./index` の export ではありません"));
+        assert!(message.contains("すでに別の名前で差し出されています"));
     }
 
     #[test]
-    fn import_missing_file_is_error() {
-        let dir = temp_dir("import-missing");
-        let message = resolve_files(&dir.path, &[("main.clum", "@./missing\n  x\n\ny = 1\n")])
+    fn ambiguous_file_and_subdir_is_error() {
+        let dir = temp_dir("ambiguous");
+        let message = resolve_files(
+            &dir.path,
+            &[
+                ("_.clum", "@./ui\n  x\n\ny = x\n"),
+                ("ui.clum", "^x: Html = h .div\n"),
+                ("ui/_.clum", "^@./inner\n  x\n"),
+                ("ui/inner.clum", "^x: Html = h .div\n"),
+            ],
+        )
+        .expect_err("エラーを期待しました");
+        assert!(message.contains("ファイル `ui.clum` とサブディレクトリ `ui/` の両方に一致します"));
+    }
+
+    #[test]
+    fn window_file_is_not_importable() {
+        let dir = temp_dir("window-import");
+        let message = resolve_files(&dir.path, &[("_.clum", "@./_\n  x\n\ny = 1\n")])
             .expect_err("エラーを期待しました");
-        assert!(message.contains("が見つかりません"));
+        assert!(message.contains("窓口 `_.clum` は import で指せません"));
+    }
+
+    #[test]
+    fn parent_file_import_is_error() {
+        let dir = temp_dir("parent-file");
+        let message = resolve_files(
+            &dir.path,
+            &[
+                ("_.clum", "@./sub\n  x\n\ny = x\n"),
+                ("page.clum", "^index: Html = h .div\n"),
+                ("sub/_.clum", "^@./util\n  x\n"),
+                (
+                    "sub/util.clum",
+                    "@../page\n  index\n\n^x: Html = h .div\n  {index}\n",
+                ),
+            ],
+        )
+        .expect_err("エラーを期待しました");
+        assert!(message.contains("フォルダの外のファイルは import できません"));
+    }
+
+    #[test]
+    fn import_of_missing_target_is_error() {
+        let message = error_of("@./missing\n  x\n\ny = 1\n");
+        assert!(
+            message.contains("`./missing` に一致するファイル・サブディレクトリが見つかりません")
+        );
+    }
+
+    #[test]
+    fn import_of_windowless_dir_is_error() {
+        let dir = temp_dir("windowless");
+        let message = resolve_files(
+            &dir.path,
+            &[
+                ("_.clum", "@./lib\n  x\n\ny = x\n"),
+                ("lib/util.clum", "^x: Html = h .div\n"),
+            ],
+        )
+        .expect_err("エラーを期待しました");
+        assert!(message.contains("`./lib` は窓口 `_.clum` を持たないため公開名がありません"));
+    }
+
+    #[test]
+    fn multi_descent_import_is_error() {
+        let message = error_of("@../a/b\n  x\n\ny = x\n");
+        assert!(message.contains("複数段の下り import"));
+        assert!(message.contains("要決定31"));
     }
 
     #[test]
     fn import_cycle_is_error() {
-        let dir = temp_dir("import-cycle");
+        let dir = temp_dir("cycle");
         let message = resolve_files(
             &dir.path,
             &[
-                ("main.clum", "@./a\n  a\n\nx = a\n"),
-                ("a.clum", "@./b\n  b\n\n:pub\na: Html = h .div\n  {b}\n"),
-                ("b.clum", "@./a\n  a\n\n:pub\nb: Html = h .div\n  {a}\n"),
+                ("_.clum", "@./a\n  a\n\nx = a\n"),
+                ("a.clum", "@./b\n  b\n\n^a: Html = h .div\n  {b}\n"),
+                ("b.clum", "@./a\n  a\n\n^b: Html = h .div\n  {a}\n"),
             ],
         )
         .expect_err("エラーを期待しました");
         assert!(message.contains("循環 import を検出しました"));
+    }
+
+    #[test]
+    fn non_window_top_level_expr_is_error() {
+        let dir = temp_dir("non-window-expr");
+        let message = resolve_files(
+            &dir.path,
+            &[
+                ("_.clum", "@./index\n  index\n\nx = index\n"),
+                (
+                    "index.clum",
+                    "^index: Html = h .div\n\nRecipe\n  documents:\n    - path: './x.html'\n      element: index\n  |> build\n  |> !\n",
+                ),
+            ],
+        )
+        .expect_err("エラーを期待しました");
+        assert!(message.contains("窓口以外のファイルのトップレベルに式は書けません"));
+    }
+
+    #[test]
+    fn entry_without_window_is_error() {
+        let dir = temp_dir("no-window");
+        let message = resolve_files(&dir.path, &[("index.clum", "^index: Html = h .div\n")])
+            .expect_err("エラーを期待しました");
+        assert!(message.contains("窓口 `_.clum` がありません"));
     }
 }

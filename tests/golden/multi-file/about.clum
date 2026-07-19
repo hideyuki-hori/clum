@@ -1,5 +1,4 @@
-:pub
-about: Html = h .html
+^about: Html = h .html
   h .head
     h .title
       {'About'}

@@ -1,5 +1,4 @@
-:pub
-home: Html = h .html
+^home: Html = h .html
   h .head
     h .title
       {'Home'}

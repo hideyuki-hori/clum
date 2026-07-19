@@ -31,6 +31,7 @@ impl Name {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decl {
+    pub exposed: bool,
     pub name: Name,
     pub params: Vec<Field>,
     pub ret: Option<TypeExpr>,
@@ -68,14 +69,21 @@ impl TypeExpr {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Import {
+    pub reexport: bool,
     pub path: Name,
-    pub names: Vec<Name>,
+    pub names: Vec<ImportEntry>,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ImportEntry {
+    pub name: Name,
+    pub source: Name,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Binding {
-    pub is_pub: bool,
+    pub exposed: bool,
     pub kind: BindingKind,
     pub span: Span,
 }

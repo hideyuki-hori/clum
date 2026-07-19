@@ -94,6 +94,10 @@ impl Diagnostic {
                 out.push(' ');
                 out.push_str(label);
             }
+        } else if let Some(label) = &self.label {
+            out.push('\n');
+            out.push_str("  = ");
+            out.push_str(label);
         }
 
         out
@@ -158,5 +162,16 @@ mod tests {
         let sources = SourceMap::new();
         let diagnostic = Diagnostic::warning("必須属性がありません");
         assert_eq!(diagnostic.render(&sources), "warning: 必須属性がありません");
+    }
+
+    #[test]
+    fn renders_label_without_location() {
+        let sources = SourceMap::new();
+        let diagnostic =
+            Diagnostic::error("窓口がありません").with_label("`_.clum` を置いてください");
+        assert_eq!(
+            diagnostic.render(&sources),
+            "error: 窓口がありません\n  = `_.clum` を置いてください"
+        );
     }
 }

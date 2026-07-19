@@ -1,5 +1,5 @@
-error: `wrong` は `./page` の export ではありません
- --> main.clum:2:3
+error: `wrong` は `./lib` の公開名ではありません
+ --> ./_.clum:2:3
   |
 2 |   wrong
-  |   ^^^^^ `./page` の export は `index` です
+  |   ^^^^^ import できるのは、そのディレクトリの窓口が `^@` で差し出した名前だけです

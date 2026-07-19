@@ -1,6 +1,5 @@
 @./a
   a
 
-:pub
-b: Html = h .div
+^b: Html = h .div
   {a}

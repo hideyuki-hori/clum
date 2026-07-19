@@ -1,0 +1,5 @@
+^# Card title: String, body: Vec<Html> -> Html
+card: Card title, body -> h .section
+  h .h2
+    {title}
+  {body}

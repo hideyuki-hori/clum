@@ -1,0 +1,9 @@
+index: Html = h .div
+  hello
+
+Recipe
+  documents:
+    - path: './dist/index.html'
+      element: index
+  |> build
+  |> !

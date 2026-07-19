@@ -488,6 +488,7 @@ impl<'a> Lexer<'a> {
         match ch {
             '#' => self.single(TokenKind::Hash),
             '@' => self.single(TokenKind::At),
+            '^' => self.single(TokenKind::Caret),
             '!' => self.single(TokenKind::Bang),
             '=' => self.single(TokenKind::Eq),
             ',' => self.single(TokenKind::Comma),
@@ -565,12 +566,14 @@ impl<'a> Lexer<'a> {
             let word = self.source[word_span.start..word_span.end].to_string();
             let full_span = Span::new(colon_pos, word_span.end);
             if word == "pub" {
-                Ok(Token::new(TokenKind::ColonWord(word), full_span))
+                Err(Diagnostic::error("`:pub` は廃止されました")
+                    .at(self.file, full_span)
+                    .with_label("公開は `^名前` の行で宣言します（例: `^index`）"))
             } else {
                 Err(
                     Diagnostic::error(format!("ステップ1では使えないコロン語です: `:{word}`"))
                         .at(self.file, full_span)
-                        .with_label("現在使えるのは `:pub` のみです"),
+                        .with_label("コロン語（`:is` 等）は後続ステップの構文です"),
                 )
             }
         } else {
@@ -1239,11 +1242,18 @@ mod tests {
     }
 
     #[test]
-    fn pub_colon_word() {
+    fn pub_colon_word_is_abolished_error() {
+        let message = error_message(":pub");
+        assert!(message.contains("`:pub` は廃止されました"));
+    }
+
+    #[test]
+    fn caret_token() {
         assert_eq!(
-            tokens_of(":pub"),
+            tokens_of("^index"),
             vec![
-                TokenKind::ColonWord("pub".to_string()),
+                TokenKind::Caret,
+                TokenKind::Ident("index".to_string()),
                 TokenKind::Newline,
                 TokenKind::Eof,
             ]

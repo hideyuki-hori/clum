@@ -1,0 +1,14 @@
+@./ui
+  MyCard = Kado
+
+index: Html = h .body
+  MyCard 'お知らせ'
+    h .p
+      本文
+
+Recipe
+  documents:
+    - path: './dist/index.html'
+      element: index
+  |> build
+  |> !

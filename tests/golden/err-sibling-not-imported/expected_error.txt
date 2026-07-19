@@ -1,0 +1,5 @@
+error: 名前 `index` は定義されていません
+ --> ./_.clum:1:5
+  |
+1 | x = index
+  |     ^^^^^ 対応する束縛・import・prelude が見つかりません

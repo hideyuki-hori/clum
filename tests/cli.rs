@@ -41,9 +41,9 @@ fn unknown_subcommand_fails_with_exit_code_1() {
 }
 
 #[test]
-fn nonexistent_file_fails_with_japanese_error() {
+fn nonexistent_dir_fails_with_japanese_error() {
     let dir = tmp_dir("nonexistent");
-    let path = dir.join("does-not-exist.clum");
+    let path = dir.join("does-not-exist");
 
     let output = bin()
         .arg("build")
@@ -53,20 +53,54 @@ fn nonexistent_file_fails_with_japanese_error() {
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.starts_with("error:"));
-    assert!(stderr.contains("読み込めません"));
+    assert!(stderr.contains("開けません"));
 
     let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn readable_file_succeeds_with_no_output() {
-    let dir = tmp_dir("readable");
+fn file_path_argument_fails_with_guidance() {
+    let dir = tmp_dir("file-arg");
     let path = dir.join("main.clum");
     fs::write(&path, "").expect("テスト用ファイルの書き込みに失敗しました");
 
     let output = bin()
         .arg("build")
         .arg(&path)
+        .output()
+        .expect("バイナリの実行に失敗しました");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("ファイルパス指定は廃止されました"));
+    assert!(stderr.contains("clum build <ディレクトリ>"));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn dir_without_window_fails_with_guidance() {
+    let dir = tmp_dir("no-window");
+
+    let output = bin()
+        .arg("build")
+        .arg(&dir)
+        .output()
+        .expect("バイナリの実行に失敗しました");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("窓口 `_.clum` がありません"));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn dir_with_window_succeeds_with_no_output() {
+    let dir = tmp_dir("readable");
+    fs::write(dir.join("_.clum"), "").expect("テスト用ファイルの書き込みに失敗しました");
+
+    let output = bin()
+        .arg("build")
+        .arg(&dir)
         .output()
         .expect("バイナリの実行に失敗しました");
     assert_eq!(output.status.code(), Some(0));

@@ -1,3 +1,2 @@
-:pub
-index: Html = h .div
+^index: Html = h .div
   hello

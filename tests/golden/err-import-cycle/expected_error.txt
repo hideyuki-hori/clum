@@ -1,5 +1,5 @@
-error: 循環 import を検出しました: a.clum -> b.clum -> a.clum
- --> b.clum:1:2
+error: 循環 import を検出しました: ./a.clum -> ./b.clum -> ./a.clum
+ --> ./b.clum:2:3
   |
-1 | @./a
-  |  ^^^
+2 |   a
+  |   ^

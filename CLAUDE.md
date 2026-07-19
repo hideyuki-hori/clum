@@ -34,7 +34,7 @@ cargo build
 cargo test                  # golden test を含む全テスト
 cargo clippy -- -D warnings # 警告ゼロを維持
 cargo fmt
-cargo run -- build ./examples/main.clum
+cargo run -- build ./examples
 ```
 
 ## 実装規約
@@ -45,7 +45,7 @@ cargo run -- build ./examples/main.clum
 - 型検査はステップ1では単相＋`map` の intrinsic 特別扱い。HM の本実装は後続ステップ。
 - エラーメッセージの品質はこの言語の価値の中心。span を使い、位置と理由を必ず示す。
 - 依存クレートの追加は**事前に相談**する（理由と代替案を添えて提案し、承認を待つ）。
-- CLI は `clum build <path>` の形式。エントリファイルは引数で明示し、暗黙のカレント探索をしない。
+- CLI は `clum build <ディレクトリ>` の形式。ビルド対象は引数で明示し、暗黙のカレント探索をしない。実行されるのは `<ディレクトリ>/_.clum`（窓口）。
 
 ## テスト
 

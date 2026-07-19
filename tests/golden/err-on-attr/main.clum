@@ -1,3 +1,0 @@
-:pub
-index: Html = h .button on-click 'handle'
-  送信

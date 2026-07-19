@@ -1,0 +1,5 @@
+error: 実装 `card` に `^` は付けません
+ --> ./card.clum:2:2
+  |
+2 | ^card: Card title -> h .div
+  |  ^^^^ `^# Card` と宣言に前置すれば、実装は双方向随伴で付いてきます

@@ -1,0 +1,9 @@
+index: Html = h .a href 'a&b"c<d>e'
+  link
+
+Recipe
+  documents:
+    - path: './dist/index.html'
+      element: index
+  |> build
+  |> !

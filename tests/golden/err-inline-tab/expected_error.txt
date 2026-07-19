@@ -1,5 +1,5 @@
 error: タブは使えません
- --> main.clum:4:17
+ --> ./_.clum:3:17
   |
-4 |     h .div class	'container'
+3 |     h .div class	'container'
   |                 ^
