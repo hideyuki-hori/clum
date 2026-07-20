@@ -1,5 +1,5 @@
 error: 定義 `Greet` の実装が複数あります（1定義=1実装）
- --> ./_.clum:3:5
+ --> ./entry.clum:3:5
   |
 3 | yo: Greet name -> name
   |     ^^^^^ 最初の実装は2行目です

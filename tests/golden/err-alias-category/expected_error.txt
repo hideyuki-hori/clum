@@ -1,5 +1,5 @@
 error: 別名は元の名前と同じ命名カテゴリで書きます
- --> ./_.clum:2:3
+ --> ./entry.clum:2:3
   |
 2 |   Db = client
   |   ^^^^^^^^^^^ 定義名（UpperCamelCase）の別名は UpperCamelCase、値（lower-kebab-case）の別名は lower-kebab-case です

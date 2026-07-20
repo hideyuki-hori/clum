@@ -1,6 +1,9 @@
+@./index
+  index
+
 Recipe
   documents:
-    - path: './dist/index.html'
+    - path: './never/index.html'
       element: index
   |> build
   |> !

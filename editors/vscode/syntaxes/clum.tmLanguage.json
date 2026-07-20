@@ -5,6 +5,7 @@
     { "include": "#comment" },
     { "include": "#string" },
     { "include": "#decl-mark" },
+    { "include": "#reexport" },
     { "include": "#import" },
     { "include": "#export-mark" },
     { "include": "#list-marker" },
@@ -63,8 +64,18 @@
       ]
     },
     "decl-mark": {
-      "match": "^\\s*(#)(?=\\s)",
-      "captures": { "1": { "name": "keyword.other.declaration.clum" } }
+      "match": "^\\s*(\\^)?(#)(?=\\s)",
+      "captures": {
+        "1": { "name": "keyword.control.export.clum" },
+        "2": { "name": "keyword.other.declaration.clum" }
+      }
+    },
+    "reexport": {
+      "match": "^(\\^@)(\\S+)?",
+      "captures": {
+        "1": { "name": "keyword.control.export.clum" },
+        "2": { "name": "string.unquoted.path.clum" }
+      }
     },
     "import": {
       "match": "^\\s*(@)(\\S+)?",

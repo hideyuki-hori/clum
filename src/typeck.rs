@@ -1068,9 +1068,10 @@ mod tests {
 
     fn typeck_of(src: &str) -> (SourceMap, Result<Vec<Diagnostic>, Diagnostic>) {
         let dir = temp_dir();
-        fs::write(dir.path.join("_.clum"), src).unwrap();
+        let entry = dir.path.join("entry.clum");
+        fs::write(&entry, src).unwrap();
         let mut sources = SourceMap::new();
-        let program = resolve_program(&mut sources, &dir.path).unwrap_or_else(|diagnostic| {
+        let program = resolve_program(&mut sources, &entry).unwrap_or_else(|diagnostic| {
             panic!(
                 "resolve に成功する前提です: {}",
                 diagnostic.render(&sources)

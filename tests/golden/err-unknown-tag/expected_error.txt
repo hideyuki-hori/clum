@@ -1,5 +1,5 @@
 error: `Tag` に `.dvi` はありません
- --> ./_.clum:3:7
+ --> ./entry.clum:3:7
   |
 3 |     h .dvi
   |       ^^^^ もしかして `.div` ですか？

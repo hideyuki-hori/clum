@@ -1,5 +1,5 @@
 error: 型が一致しません: `String` 型を期待しましたが、`i32` 型が来ました
- --> ./_.clum:1:17
+ --> ./entry.clum:1:17
   |
 1 | title: String = 42
   |                 ^^

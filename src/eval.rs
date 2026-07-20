@@ -693,9 +693,9 @@ mod tests {
         TmpDir { path }
     }
 
-    fn checked_program(dir: &Path) -> (SourceMap, crate::resolve::Program) {
+    fn checked_program(entry: &Path) -> (SourceMap, crate::resolve::Program) {
         let mut sources = SourceMap::new();
-        let program = resolve_program(&mut sources, dir).unwrap_or_else(|diagnostic| {
+        let program = resolve_program(&mut sources, entry).unwrap_or_else(|diagnostic| {
             panic!(
                 "resolve に成功する前提です: {}",
                 diagnostic.render(&sources)
@@ -709,8 +709,9 @@ mod tests {
 
     fn eval_value(src: &str, name: &str) -> Value {
         let dir = temp_dir("value");
-        fs::write(dir.path.join("_.clum"), src).unwrap();
-        let (sources, program) = checked_program(&dir.path);
+        let entry = dir.path.join("entry.clum");
+        fs::write(&entry, src).unwrap();
+        let (sources, program) = checked_program(&entry);
         let modules_by_file: HashMap<FileId, &Module> = program
             .modules
             .iter()
@@ -973,9 +974,9 @@ mod tests {
             "  |> build\n",
             "  |> !\n",
         );
-        fs::write(dir.path.join("_.clum"), src).unwrap();
+        fs::write(dir.path.join("site.clum"), src).unwrap();
 
-        let (sources, program) = checked_program(&dir.path);
+        let (sources, program) = checked_program(&dir.path.join("site.clum"));
         eval_program(&sources, &program).expect("評価に成功する前提です");
 
         let output = fs::read_to_string(dir.path.join("dist/index.html")).unwrap();
@@ -999,9 +1000,9 @@ mod tests {
             "  |> build\n",
             "  |> !\n",
         );
-        fs::write(dir.path.join("_.clum"), src).unwrap();
+        fs::write(dir.path.join("site.clum"), src).unwrap();
 
-        let (sources, program) = checked_program(&dir.path);
+        let (sources, program) = checked_program(&dir.path.join("site.clum"));
         eval_program(&sources, &program).expect("評価に成功する前提です");
 
         assert!(dir.path.join("dist/a.html").is_file());
@@ -1017,7 +1018,7 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            dir.path.join("_.clum"),
+            dir.path.join("site.clum"),
             concat!(
                 "@./index\n",
                 "  index\n",
@@ -1032,7 +1033,7 @@ mod tests {
         )
         .unwrap();
 
-        let (sources, program) = checked_program(&dir.path);
+        let (sources, program) = checked_program(&dir.path.join("site.clum"));
         eval_program(&sources, &program).expect("評価に成功する前提です");
 
         let output = fs::read_to_string(dir.path.join("dist/index.html")).unwrap();
@@ -1053,7 +1054,7 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            dir.path.join("_.clum"),
+            dir.path.join("site.clum"),
             concat!(
                 "@./card\n",
                 "  Card\n",
@@ -1073,7 +1074,7 @@ mod tests {
         )
         .unwrap();
 
-        let (sources, program) = checked_program(&dir.path);
+        let (sources, program) = checked_program(&dir.path.join("site.clum"));
         eval_program(&sources, &program).expect("評価に成功する前提です");
 
         let output = fs::read_to_string(dir.path.join("dist/index.html")).unwrap();
@@ -1081,8 +1082,8 @@ mod tests {
     }
 
     #[test]
-    fn imported_window_exprs_do_not_run() {
-        let dir = temp_dir("window-no-run");
+    fn program_file_exprs_do_not_run_unless_entry() {
+        let dir = temp_dir("program-no-run");
         fs::create_dir_all(dir.path.join("lib")).unwrap();
         fs::write(
             dir.path.join("lib/page.clum"),
@@ -1090,9 +1091,9 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            dir.path.join("lib/_.clum"),
+            dir.path.join("lib/recipe.clum"),
             concat!(
-                "^@./page\n",
+                "@./page\n",
                 "  page\n",
                 "\n",
                 "Recipe\n",
@@ -1104,8 +1105,9 @@ mod tests {
             ),
         )
         .unwrap();
+        fs::write(dir.path.join("lib/_.clum"), "^@./page\n  page\n").unwrap();
         fs::write(
-            dir.path.join("_.clum"),
+            dir.path.join("site.clum"),
             concat!(
                 "@./lib\n",
                 "  page\n",
@@ -1120,7 +1122,7 @@ mod tests {
         )
         .unwrap();
 
-        let (sources, program) = checked_program(&dir.path);
+        let (sources, program) = checked_program(&dir.path.join("site.clum"));
         eval_program(&sources, &program).expect("評価に成功する前提です");
 
         assert!(dir.path.join("dist/index.html").is_file());

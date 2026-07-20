@@ -77,22 +77,50 @@ struct NsEntry {
     kind: ImportedKind,
 }
 
-pub fn resolve_program(sources: &mut SourceMap, dir: &Path) -> Result<Program, Diagnostic> {
-    let canon = fs::canonicalize(dir).map_err(|err| {
+pub fn resolve_program(sources: &mut SourceMap, entry_path: &Path) -> Result<Program, Diagnostic> {
+    let canon = fs::canonicalize(entry_path).map_err(|err| {
         Diagnostic::error(format!(
-            "ディレクトリ `{}` を開けません: {err}",
-            dir.display()
+            "エントリファイル `{}` を開けません: {err}",
+            entry_path.display()
         ))
     })?;
-    if !canon.is_dir() {
+    if canon.is_dir() {
         return Err(Diagnostic::error(format!(
-            "`{}` はディレクトリではありません",
-            dir.display()
+            "`{}` はディレクトリです。ディレクトリ指定は廃止されました",
+            entry_path.display()
         ))
         .with_label(
-            "`clum build <ディレクトリ>` の形で指定します（ファイルパス指定は廃止されました）",
+            "`clum build <エントリファイル>` の形で指定します（例: `clum build ./dev.clum`）",
         ));
     }
+    let file_name = canon
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if !file_name.ends_with(".clum") {
+        return Err(Diagnostic::error(format!(
+            "`{}` は `.clum` ファイルではありません",
+            entry_path.display()
+        ))
+        .with_label("エントリには `.clum` ファイルを指定します"));
+    }
+    if file_name == WINDOW_FILE {
+        return Err(Diagnostic::error(format!(
+            "窓口 `{WINDOW_FILE}` はエントリに指定できません"
+        ))
+        .with_label("窓口は公開面専用です。実行するプログラムは自由な名前のエントリファイルに書きます"));
+    }
+    let Some(dir_canon) = canon.parent().map(Path::to_path_buf) else {
+        return Err(Diagnostic::error(format!(
+            "エントリファイル `{}` の親ディレクトリが取れません",
+            entry_path.display()
+        )));
+    };
+    let dir_display = entry_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(clean_display)
+        .unwrap_or_else(|| PathBuf::from("."));
     let mut loader = Loader {
         sources,
         dir_ids: HashMap::new(),
@@ -101,14 +129,14 @@ pub fn resolve_program(sources: &mut SourceMap, dir: &Path) -> Result<Program, D
         by_file: HashMap::new(),
         pending: Vec::new(),
     };
-    let entry_dir = loader.ensure_dir(canon, clean_display(dir), None)?;
-    let Some(entry) = loader.dirs[entry_dir].window else {
-        return Err(Diagnostic::error(format!(
-            "`{}` に窓口 `{WINDOW_FILE}` がありません",
-            dir.display()
-        ))
-        .with_label("`clum build <ディレクトリ>` はそのディレクトリの窓口 `_.clum` を実行します"));
-    };
+    let entry_dir = loader.ensure_dir(dir_canon, dir_display, None)?;
+    let entry_stem = file_name.trim_end_matches(".clum");
+    let entry = loader
+        .files
+        .iter()
+        .find(|entry| entry.dir == entry_dir && entry.stem == entry_stem)
+        .map(|entry| entry.file)
+        .expect("エントリファイルはディレクトリの走査に含まれるはずです");
     while let Some(index) = loader.pending.pop() {
         loader.resolve_imports(index)?;
     }
@@ -142,6 +170,7 @@ struct FileEntry {
     file: FileId,
     dir: usize,
     is_window: bool,
+    has_exprs: bool,
     stem: String,
     module: Module,
     exports: HashMap<String, ImportedKind>,
@@ -218,8 +247,13 @@ impl Loader<'_> {
             let module = parse(&content, file)?;
             let is_window = name == WINDOW_FILE;
             if is_window {
+                check_window_contents(file, &module)?;
                 self.dirs[id].window = Some(file);
             }
+            let has_exprs = module
+                .items
+                .iter()
+                .any(|item| matches!(item, Item::Expr(_)));
             let stem = name.trim_end_matches(".clum").to_string();
             let index = self.files.len();
             self.by_file.insert(file, index);
@@ -227,6 +261,7 @@ impl Loader<'_> {
                 file,
                 dir: id,
                 is_window,
+                has_exprs,
                 stem,
                 module,
                 exports: HashMap::new(),
@@ -330,6 +365,14 @@ impl Loader<'_> {
             for entry in &import.names {
                 let ns_entry = match &target {
                     SiblingTarget::File(file_index) => {
+                        if self.files[*file_index].has_exprs {
+                            return Err(Diagnostic::error(format!(
+                                "`{}` はプログラムファイルです（トップレベルに式があります）。差し出せません",
+                                import.path.text
+                            ))
+                            .at(window, import.path.span)
+                            .with_label("プログラムファイルは `clum build` で実行する対象です"));
+                        }
                         let origin = self.files[*file_index].file;
                         let Some(kind) = self.files[*file_index].exports.get(&entry.source.text)
                         else {
@@ -596,6 +639,14 @@ impl Loader<'_> {
         target_index: usize,
         import: &Import,
     ) -> Result<Vec<ImportedName>, Diagnostic> {
+        if self.files[target_index].has_exprs {
+            return Err(Diagnostic::error(format!(
+                "`{}` はプログラムファイルです（トップレベルに式があります）。import できません",
+                import.path.text
+            ))
+            .at(file, import.path.span)
+            .with_label("プログラムファイルは `clum build` で実行する対象です"));
+        }
         let origin = self.files[target_index].file;
         let mut names = Vec::new();
         for entry in &import.names {
@@ -645,9 +696,6 @@ impl Loader<'_> {
 
     fn check_file(&mut self, index: usize) -> Result<(), Diagnostic> {
         let entry = &self.files[index];
-        if !entry.is_window {
-            check_no_top_level_exprs(entry.file, &entry.module)?;
-        }
         let mut checker = Checker::new(self.sources, entry.file);
         checker.check(&entry.module, &entry.imports)
     }
@@ -805,17 +853,22 @@ fn order_files(
     Ok(ordered)
 }
 
-fn check_no_top_level_exprs(file: FileId, module: &Module) -> Result<(), Diagnostic> {
+fn check_window_contents(file: FileId, module: &Module) -> Result<(), Diagnostic> {
     for item in &module.items {
-        if let Item::Expr(expr) = item {
-            return Err(Diagnostic::error(
-                "窓口以外のファイルのトップレベルに式は書けません",
-            )
-            .at(file, expr.span())
-            .with_label(
-                "トップレベルの式列を持てるのは窓口 `_.clum` だけです。値が必要なら `名前 = 式` で束縛してください",
-            ));
-        }
+        let span = match item {
+            Item::Import(import) if import.reexport => continue,
+            Item::Import(import) => import.span,
+            Item::Decl(decl) => decl.span,
+            Item::Binding(binding) => binding.span,
+            Item::Expr(expr) => expr.span(),
+        };
+        return Err(Diagnostic::error(
+            "窓口 `_.clum` に書けるのは `^@` ブロックだけです",
+        )
+        .at(file, span)
+        .with_label(
+            "窓口はディレクトリの公開面専用です。束縛・宣言・式はエントリファイルか通常のモジュールに書きます",
+        ));
     }
     Ok(())
 }
@@ -1289,7 +1342,7 @@ mod tests {
         TmpDir { path }
     }
 
-    fn resolve_files(dir: &Path, files: &[(&str, &str)]) -> Result<Program, String> {
+    fn resolve_files(dir: &Path, entry: &str, files: &[(&str, &str)]) -> Result<Program, String> {
         for (name, content) in files {
             let path = dir.join(name);
             if let Some(parent) = path.parent() {
@@ -1298,19 +1351,19 @@ mod tests {
             fs::write(path, content).unwrap();
         }
         let mut sources = SourceMap::new();
-        match resolve_program(&mut sources, dir) {
+        match resolve_program(&mut sources, &dir.join(entry)) {
             Ok(program) => Ok(program),
             Err(diagnostic) => Err(diagnostic.render(&sources)),
         }
     }
 
-    fn resolve_window(src: &str) -> Result<Program, String> {
+    fn resolve_entry(src: &str) -> Result<Program, String> {
         let dir = temp_dir("single");
-        resolve_files(&dir.path, &[("_.clum", src)])
+        resolve_files(&dir.path, "entry.clum", &[("entry.clum", src)])
     }
 
     fn error_of(src: &str) -> String {
-        resolve_window(src).expect_err("エラーを期待しました")
+        resolve_entry(src).expect_err("エラーを期待しました")
     }
 
     #[test]
@@ -1322,7 +1375,7 @@ mod tests {
 
     #[test]
     fn top_level_reference_resolves() {
-        assert!(resolve_window("title = 'home'\nx = title\n").is_ok());
+        assert!(resolve_entry("title = 'home'\nx = title\n").is_ok());
     }
 
     #[test]
@@ -1336,7 +1389,7 @@ mod tests {
             "    h .p\n",
             "      本文\n",
         );
-        assert!(resolve_window(src).is_ok());
+        assert!(resolve_entry(src).is_ok());
     }
 
     #[test]
@@ -1370,8 +1423,9 @@ mod tests {
         let dir = temp_dir("sibling-file");
         let result = resolve_files(
             &dir.path,
+            "entry.clum",
             &[
-                ("_.clum", "@./index\n  index\n\nx = index\n"),
+                ("entry.clum", "@./index\n  index\n\nx = index\n"),
                 ("index.clum", "^index: Html = h .div\n"),
             ],
         );
@@ -1383,9 +1437,10 @@ mod tests {
         let dir = temp_dir("sibling-pair");
         let result = resolve_files(
             &dir.path,
+            "entry.clum",
             &[
                 (
-                    "_.clum",
+                    "entry.clum",
                     "@./card\n  Card\n\npage: Html = h .body\n  Card 'x'\n    h .p\n      本文\nused = card\n",
                 ),
                 (
@@ -1402,8 +1457,9 @@ mod tests {
         let dir = temp_dir("sibling-implicit");
         let message = resolve_files(
             &dir.path,
+            "entry.clum",
             &[
-                ("_.clum", "x = index\n"),
+                ("entry.clum", "x = index\n"),
                 ("index.clum", "^index: Html = h .div\n"),
             ],
         )
@@ -1416,8 +1472,9 @@ mod tests {
         let dir = temp_dir("sibling-private");
         let message = resolve_files(
             &dir.path,
+            "entry.clum",
             &[
-                ("_.clum", "@./util\n  helper\n\nx = helper\n"),
+                ("entry.clum", "@./util\n  helper\n\nx = helper\n"),
                 ("util.clum", "helper: i32 = 1\n"),
             ],
         )
@@ -1430,9 +1487,10 @@ mod tests {
         let dir = temp_dir("same-name");
         let result = resolve_files(
             &dir.path,
+            "entry.clum",
             &[
                 (
-                    "_.clum",
+                    "entry.clum",
                     "@./a\n  index\n\n@./b\n  b-index = index\n\nx = index\ny = b-index\n",
                 ),
                 ("a.clum", "^index: Html = h .div\n"),
@@ -1464,7 +1522,13 @@ mod tests {
 
     #[test]
     fn caret_at_dot_is_error() {
-        let message = error_of("^@.\n  index\n");
+        let dir = temp_dir("caret-at-dot");
+        let message = resolve_files(
+            &dir.path,
+            "entry.clum",
+            &[("entry.clum", "x = 1\n"), ("_.clum", "^@.\n  index\n")],
+        )
+        .expect_err("エラーを期待しました");
         assert!(message.contains("`^@` のパス `.` が不正です"));
         assert!(message.contains("出どころを明示します"));
     }
@@ -1474,8 +1538,9 @@ mod tests {
         let dir = temp_dir("reexport-outside");
         let message = resolve_files(
             &dir.path,
+            "entry.clum",
             &[
-                ("_.clum", "x = 1\n"),
+                ("entry.clum", "x = 1\n"),
                 ("page.clum", "^@./lib\n  x\n\n^index: Html = h .div\n"),
             ],
         )
@@ -1484,12 +1549,79 @@ mod tests {
     }
 
     #[test]
+    fn window_content_is_error() {
+        let dir = temp_dir("window-content");
+        let message = resolve_files(
+            &dir.path,
+            "entry.clum",
+            &[("entry.clum", "x = 1\n"), ("_.clum", "y = 2\n")],
+        )
+        .expect_err("エラーを期待しました");
+        assert!(message.contains("窓口 `_.clum` に書けるのは `^@` ブロックだけです"));
+    }
+
+    #[test]
+    fn window_as_entry_is_error() {
+        let dir = temp_dir("window-entry");
+        let message = resolve_files(
+            &dir.path,
+            "_.clum",
+            &[
+                ("_.clum", "^@./page\n  index\n"),
+                ("page.clum", "^index: Html = h .div\n"),
+            ],
+        )
+        .expect_err("エラーを期待しました");
+        assert!(message.contains("窓口 `_.clum` はエントリに指定できません"));
+    }
+
+    #[test]
+    fn program_file_import_is_error() {
+        let dir = temp_dir("program-import");
+        let message = resolve_files(
+            &dir.path,
+            "entry.clum",
+            &[
+                ("entry.clum", "@./other\n  x\n\ny = x\n"),
+                (
+                    "other.clum",
+                    "^x: Html = h .div\n\nRecipe\n  documents:\n    - path: './a.html'\n      element: x\n  |> build\n  |> !\n",
+                ),
+            ],
+        )
+        .expect_err("エラーを期待しました");
+        assert!(message.contains("`./other` はプログラムファイルです"));
+    }
+
+    #[test]
+    fn coexisting_program_files_are_allowed() {
+        let dir = temp_dir("two-entries");
+        let result = resolve_files(
+            &dir.path,
+            "dev.clum",
+            &[
+                (
+                    "dev.clum",
+                    "@./index\n  index\n\nRecipe\n  documents:\n    - path: './dev-dist/index.html'\n      element: index\n  |> build\n  |> !\n",
+                ),
+                (
+                    "prd.clum",
+                    "@./index\n  index\n\nRecipe\n  documents:\n    - path: './prd-dist/index.html'\n      element: index\n  |> build\n  |> !\n",
+                ),
+                ("index.clum", "^index: Html = h .div\n"),
+            ],
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
     fn window_reexports_sibling_file() {
         let dir = temp_dir("face-file");
         let result = resolve_files(
             &dir.path,
+            "entry.clum",
             &[
-                ("_.clum", "@./lib\n  page\n\nx = page\n"),
+                ("entry.clum", "@./lib\n  page\n\nx = page\n"),
                 ("lib/_.clum", "^@./page\n  page\n"),
                 ("lib/page.clum", "^page: Html = h .div\n"),
             ],
@@ -1502,9 +1634,10 @@ mod tests {
         let dir = temp_dir("face-alias");
         let result = resolve_files(
             &dir.path,
+            "entry.clum",
             &[
                 (
-                    "_.clum",
+                    "entry.clum",
                     "@./ui\n  Kado\n\npage: Html = h .body\n  Kado 'x'\n    h .p\n      本文\nused = kado\n",
                 ),
                 ("ui/_.clum", "^@./card\n  Kado = Card\n"),
@@ -1522,8 +1655,9 @@ mod tests {
         let dir = temp_dir("import-alias");
         let result = resolve_files(
             &dir.path,
+            "entry.clum",
             &[
-                ("_.clum", "@./page\n  front = index\n\nx = front\n"),
+                ("entry.clum", "@./page\n  front = index\n\nx = front\n"),
                 ("page.clum", "^index: Html = h .div\n"),
             ],
         );
@@ -1535,9 +1669,10 @@ mod tests {
         let dir = temp_dir("relay");
         let result = resolve_files(
             &dir.path,
+            "entry.clum",
             &[
                 (
-                    "_.clum",
+                    "entry.clum",
                     "@./ui\n  Card\n\npage: Html = h .body\n  Card 'x'\n    h .p\n      本文\n",
                 ),
                 ("ui/_.clum", "^@./parts\n  Card\n"),
@@ -1556,7 +1691,9 @@ mod tests {
         let dir = temp_dir("face-unknown");
         let message = resolve_files(
             &dir.path,
+            "entry.clum",
             &[
+                ("entry.clum", "x = 1\n"),
                 ("_.clum", "^@./page\n  missing\n"),
                 ("page.clum", "^index: Html = h .div\n"),
             ],
@@ -1570,7 +1707,9 @@ mod tests {
         let dir = temp_dir("face-dup");
         let message = resolve_files(
             &dir.path,
+            "entry.clum",
             &[
+                ("entry.clum", "x = 1\n"),
                 ("_.clum", "^@./pages\n  index\n  index = about\n"),
                 (
                     "pages.clum",
@@ -1587,7 +1726,9 @@ mod tests {
         let dir = temp_dir("face-dup-source");
         let message = resolve_files(
             &dir.path,
+            "entry.clum",
             &[
+                ("entry.clum", "x = 1\n"),
                 ("_.clum", "^@./pages\n  index\n  home = index\n"),
                 ("pages.clum", "^index: Html = h .div\n"),
             ],
@@ -1597,46 +1738,19 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_file_and_subdir_is_error() {
-        let dir = temp_dir("ambiguous");
+    fn import_of_unoffered_name_is_error() {
+        let dir = temp_dir("unoffered");
         let message = resolve_files(
             &dir.path,
+            "entry.clum",
             &[
-                ("_.clum", "@./ui\n  x\n\ny = x\n"),
-                ("ui.clum", "^x: Html = h .div\n"),
-                ("ui/_.clum", "^@./inner\n  x\n"),
-                ("ui/inner.clum", "^x: Html = h .div\n"),
+                ("entry.clum", "@./lib\n  wrong\n\nx = wrong\n"),
+                ("lib/_.clum", "^@./page\n  page\n"),
+                ("lib/page.clum", "^page: Html = h .div\n"),
             ],
         )
         .expect_err("エラーを期待しました");
-        assert!(message.contains("ファイル `ui.clum` とサブディレクトリ `ui/` の両方に一致します"));
-    }
-
-    #[test]
-    fn window_file_is_not_importable() {
-        let dir = temp_dir("window-import");
-        let message = resolve_files(&dir.path, &[("_.clum", "@./_\n  x\n\ny = 1\n")])
-            .expect_err("エラーを期待しました");
-        assert!(message.contains("窓口 `_.clum` は import で指せません"));
-    }
-
-    #[test]
-    fn parent_file_import_is_error() {
-        let dir = temp_dir("parent-file");
-        let message = resolve_files(
-            &dir.path,
-            &[
-                ("_.clum", "@./sub\n  x\n\ny = x\n"),
-                ("page.clum", "^index: Html = h .div\n"),
-                ("sub/_.clum", "^@./util\n  x\n"),
-                (
-                    "sub/util.clum",
-                    "@../page\n  index\n\n^x: Html = h .div\n  {index}\n",
-                ),
-            ],
-        )
-        .expect_err("エラーを期待しました");
-        assert!(message.contains("フォルダの外のファイルは import できません"));
+        assert!(message.contains("`wrong` は `./lib` の公開名ではありません"));
     }
 
     #[test]
@@ -1652,8 +1766,9 @@ mod tests {
         let dir = temp_dir("windowless");
         let message = resolve_files(
             &dir.path,
+            "entry.clum",
             &[
-                ("_.clum", "@./lib\n  x\n\ny = x\n"),
+                ("entry.clum", "@./lib\n  x\n\ny = x\n"),
                 ("lib/util.clum", "^x: Html = h .div\n"),
             ],
         )
@@ -1663,9 +1778,52 @@ mod tests {
 
     #[test]
     fn multi_descent_import_is_error() {
-        let message = error_of("@../a/b\n  x\n\ny = x\n");
+        let message = error_of("@./a/b\n  x\n\ny = x\n");
         assert!(message.contains("複数段の下り import"));
         assert!(message.contains("要決定31"));
+    }
+
+    #[test]
+    fn ambiguous_file_and_subdir_is_error() {
+        let dir = temp_dir("ambiguous");
+        let message = resolve_files(
+            &dir.path,
+            "entry.clum",
+            &[
+                ("entry.clum", "@./ui\n  x\n\ny = x\n"),
+                ("ui.clum", "^x: Html = h .div\n"),
+                ("ui/_.clum", "^@./inner\n  x\n"),
+                ("ui/inner.clum", "^x: Html = h .div\n"),
+            ],
+        )
+        .expect_err("エラーを期待しました");
+        assert!(message.contains("ファイル `ui.clum` とサブディレクトリ `ui/` の両方に一致します"));
+    }
+
+    #[test]
+    fn window_file_is_not_importable() {
+        let message = error_of("@./_\n  x\n\ny = 1\n");
+        assert!(message.contains("窓口 `_.clum` は import で指せません"));
+    }
+
+    #[test]
+    fn parent_file_import_is_error() {
+        let dir = temp_dir("parent-file");
+        let message = resolve_files(
+            &dir.path,
+            "entry.clum",
+            &[
+                ("entry.clum", "@./sub\n  x\n\ny = x\n"),
+                ("page.clum", "^index: Html = h .div\n"),
+                ("sub/_.clum", "^@./util\n  x\n"),
+                (
+                    "sub/util.clum",
+                    "@../page\n  index\n\n^x: Html = h .div\n  {index}\n",
+                ),
+            ],
+        )
+        .expect_err("エラーを期待しました");
+        assert!(message.contains("フォルダの外のファイルは import できません"));
     }
 
     #[test]
@@ -1673,8 +1831,9 @@ mod tests {
         let dir = temp_dir("cycle");
         let message = resolve_files(
             &dir.path,
+            "entry.clum",
             &[
-                ("_.clum", "@./a\n  a\n\nx = a\n"),
+                ("entry.clum", "@./a\n  a\n\nx = a\n"),
                 ("a.clum", "@./b\n  b\n\n^a: Html = h .div\n  {b}\n"),
                 ("b.clum", "@./a\n  a\n\n^b: Html = h .div\n  {a}\n"),
             ],
@@ -1684,27 +1843,15 @@ mod tests {
     }
 
     #[test]
-    fn non_window_top_level_expr_is_error() {
-        let dir = temp_dir("non-window-expr");
+    fn missing_entry_is_error() {
+        let dir = temp_dir("missing-entry");
         let message = resolve_files(
             &dir.path,
-            &[
-                ("_.clum", "@./index\n  index\n\nx = index\n"),
-                (
-                    "index.clum",
-                    "^index: Html = h .div\n\nRecipe\n  documents:\n    - path: './x.html'\n      element: index\n  |> build\n  |> !\n",
-                ),
-            ],
+            "nope.clum",
+            &[("index.clum", "^index: Html = h .div\n")],
         )
         .expect_err("エラーを期待しました");
-        assert!(message.contains("窓口以外のファイルのトップレベルに式は書けません"));
-    }
-
-    #[test]
-    fn entry_without_window_is_error() {
-        let dir = temp_dir("no-window");
-        let message = resolve_files(&dir.path, &[("index.clum", "^index: Html = h .div\n")])
-            .expect_err("エラーを期待しました");
-        assert!(message.contains("窓口 `_.clum` がありません"));
+        assert!(message.contains("エントリファイル"));
+        assert!(message.contains("開けません"));
     }
 }

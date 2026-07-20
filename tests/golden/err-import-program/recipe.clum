@@ -1,0 +1,8 @@
+^x: Html = h .div
+
+Recipe
+  documents:
+    - path: './a.html'
+      element: x
+  |> build
+  |> !

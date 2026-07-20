@@ -1,5 +1,0 @@
-error: 名前 `index` は定義されていません
- --> ./_.clum:4:16
-  |
-4 |       element: index
-  |                ^^^^^ 対応する束縛・import・prelude が見つかりません

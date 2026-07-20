@@ -84,7 +84,7 @@ fn run_case(case_dir: &Path, update: bool) {
 
     let output = Command::new(env!("CARGO_BIN_EXE_clum"))
         .arg("build")
-        .arg(".")
+        .arg("entry.clum")
         .current_dir(&tmp.path)
         .output()
         .unwrap_or_else(|e| panic!("case {case_name}: バイナリの実行に失敗しました: {e}"));
