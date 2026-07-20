@@ -1,17 +1,25 @@
 {
   "name": "clum",
   "displayName": "clum",
-  "description": "clum 言語のシンタックスハイライト（粗版）",
+  "description": "clum 言語のシンタックスハイライト",
   "version": "0.0.1",
   "publisher": "clum",
-  "engines": { "vscode": "^1.75.0" },
-  "categories": ["Programming Languages"],
+  "engines": {
+    "vscode": "^1.102.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
   "contributes": {
     "languages": [
       {
         "id": "clum",
-        "aliases": ["clum"],
-        "extensions": [".clum"],
+        "aliases": [
+          "clum"
+        ],
+        "extensions": [
+          ".clum"
+        ],
         "configuration": "./language-configuration.json"
       }
     ],
